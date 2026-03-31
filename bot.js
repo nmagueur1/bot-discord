@@ -5,7 +5,6 @@ const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes,
 const { initializeApp } = require('firebase/app');
 const { getFirestore, doc, getDoc, setDoc } = require('firebase/firestore');
 const admin = require('firebase-admin');
-const admin = require('firebase-admin');
 
 // Parse le JSON depuis l'env
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
