@@ -15,9 +15,6 @@ admin.initializeApp({
 
 console.log('Firebase initialisé ✅');
 
-// ── FIREBASE ADMIN ────────────────────────────────
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-
 // ── FIREBASE CLIENT ───────────────────────────────
 const firebaseConfig = {
   apiKey:            process.env.FIREBASE_API_KEY,
