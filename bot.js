@@ -1652,14 +1652,39 @@ client.on('interactionCreate', async interaction => {
       const channel = client.channels.cache.get(AVIS_CHANNEL_ID);
       if (!channel) { await interaction.reply({ content: '❌ Salon des avis introuvable.', ephemeral: true }); return; }
 
+      // ── Sauvegarde dans Firebase + calcul note globale ──
+      let noteGlobale = note;
+      let nbAvis = 1;
+      try {
+        const snap = await getDoc(REF);
+        const data = snap.exists() ? snap.data() : {};
+        const avisArray = Array.isArray(data.avis) ? [...data.avis] : [];
+        avisArray.push({
+          id:     Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+          ts:     Date.now(),
+          note,
+          texte:  avis,
+          agent:  agent || null,
+          auteur: interaction.user.username,
+        });
+        nbAvis      = avisArray.length;
+        noteGlobale = Math.round((avisArray.reduce((s, a) => s + a.note, 0) / nbAvis) * 10) / 10;
+        await setDoc(REF, { ...data, avis: avisArray, meta: { ...(data.meta || {}), updated: Date.now() } });
+      } catch (fbErr) {
+        console.error('Erreur Firebase avis:', fbErr);
+      }
+
+      const noteGlobaleEtoiles = '⭐'.repeat(Math.round(noteGlobale)) + '☆'.repeat(5 - Math.round(noteGlobale));
+
       await channel.send({ embeds: [{
         title: `${etoiles} — Avis client`,
         color: couleur,
         description: `*"${avis}"*`,
         fields: [
-          { name: '⭐ Note',    value: `**${note}/5**`,               inline: true },
-          { name: '👤 Client',  value: `<@${interaction.user.id}>`,  inline: true },
+          { name: '⭐ Note',          value: `**${note}/5**`,                                          inline: true },
+          { name: '👤 Client',        value: `<@${interaction.user.id}>`,                             inline: true },
           ...(agent ? [{ name: '🤝 Agent', value: agent, inline: true }] : []),
+          { name: '📊 Note globale', value: `**${noteGlobale}/5** ${noteGlobaleEtoiles} *(${nbAvis} avis)*`, inline: false },
         ],
         thumbnail: { url: interaction.user.displayAvatarURL({ dynamic: true }) },
         timestamp: new Date().toISOString(),
