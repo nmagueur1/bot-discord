@@ -39,7 +39,11 @@ const REGLEMENT_CHANNEL_ID= '1486169077855813752'; // Salon règlement
 const TICKET_CHANNEL_ID   = '1488697077645971607'; // Salon tickets
 const ANNONCES_CHANNEL_ID  = '1488696390933680139'; // Salon annonces
 const NEWS_CHANNEL_ID      = '1488696763337674852'; // Salon news / nouveautés
-const TICKET_CATEGORY_ID   = '1488703536739909722'; // Catégorie où créer les salons de ticket
+const TICKET_CATEGORY_ID       = '1488703536739909722'; // Catégorie où créer les salons de ticket
+const RECRUTEMENT_STAFF_ID     = '1488710114687979660'; // Salon staff pour examiner les candidatures
+
+// ── STORE CANDIDATURES (en mémoire) ──────────────
+const candidatures = {};
 const AVIS_CHANNEL_ID      = '1488696917084082187'; // Salon où poster les avis clients
 
 // ── OPTIONS TICKETS ───────────────────────────────
@@ -579,11 +583,84 @@ client.on('interactionCreate', async interaction => {
   }
 
   // ════════════════════════════════════════════════
+  // SELECT MENU — PERMIS RECRUTEMENT
+  // ════════════════════════════════════════════════
+  if (interaction.isStringSelectMenu() && interaction.customId === 'recruit-permis') {
+    const d = candidatures[interaction.user.id];
+    if (!d) { await interaction.reply({ content: '❌ Session expirée, recommence la candidature.', ephemeral: true }); return; }
+    d.permis = interaction.values[0] === 'oui' ? '✅ Oui' : '❌ Non';
+
+    const staffChannel = interaction.guild.channels.cache.get(RECRUTEMENT_STAFF_ID);
+    if (!staffChannel) { await interaction.reply({ content: '❌ Salon staff introuvable.', ephemeral: true }); return; }
+
+    const acceptBtn = new ButtonBuilder().setCustomId(`recruit-accept_${interaction.user.id}`).setLabel('Accepter').setEmoji('✅').setStyle(ButtonStyle.Success);
+    const refuseBtn = new ButtonBuilder().setCustomId(`recruit-refuse_${interaction.user.id}`).setLabel('Refuser').setEmoji('❌').setStyle(ButtonStyle.Danger);
+
+    await staffChannel.send({
+      embeds: [{
+        title: '📩 Nouvelle candidature — Agence Immobilière',
+        color: 0xf4c542,
+        thumbnail: { url: interaction.user.displayAvatarURL({ dynamic: true }) },
+        fields: [
+          { name: '👤 Pseudo Discord',      value: d.pseudo,       inline: true  },
+          { name: '🆔 ID Unique',           value: d.id,           inline: true  },
+          { name: '🎂 Âge HRP',             value: d.age,          inline: true  },
+          { name: '📅 Disponibilités',      value: d.dispo,        inline: false },
+          { name: '💗 Identité RP',         value: d.identite,     inline: true  },
+          { name: '🎂 Date de naissance',   value: d.naissance,    inline: true  },
+          { name: '📱 Téléphone RP',        value: d.tel,          inline: true  },
+          { name: '🌍 Nationalité',         value: d.nationalite,  inline: true  },
+          { name: '💼 Profession actuelle', value: d.metier,       inline: true  },
+          { name: '🚗 Permis de conduire',  value: d.permis,       inline: true  },
+          { name: '✍️ Motivation',          value: d.motivation,   inline: false },
+          { name: '⭐ Pourquoi ce candidat',value: d.pourquoi,     inline: false },
+        ],
+        timestamp: new Date().toISOString(),
+        footer: { text: `Candidat · ${interaction.user.tag}` },
+      }],
+      components: [new ActionRowBuilder().addComponents(acceptBtn, refuseBtn)],
+    });
+
+    await interaction.reply({
+      embeds: [{
+        title: '✅ Candidature envoyée',
+        color: 0x4caf50,
+        description: 'Votre candidature a bien été transmise à notre équipe.\nNous reviendrons vers vous dans les meilleurs délais. Merci pour votre intérêt envers l\'Agence Immobilière !',
+        footer: { text: 'Agence Immobilière · Recrutement' },
+      }],
+      ephemeral: true,
+    });
+  }
+
+  // ════════════════════════════════════════════════
   // SELECT MENU — TICKET
   // ════════════════════════════════════════════════
   if (interaction.isStringSelectMenu() && interaction.customId === 'ticket-select') {
     const val    = interaction.values[0];
     const option = TICKET_OPTIONS.find(o => o.value === val);
+
+    // ── CAS RECRUTEMENT : formulaire multi-étapes ──
+    if (val === 'recrutement') {
+      const modal = new ModalBuilder()
+        .setCustomId('recruit-step1')
+        .setTitle('📩 Candidature — Étape 1/3');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('pseudo').setLabel('👤 Pseudo Discord').setStyle(TextInputStyle.Short).setValue(interaction.user.username).setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('id').setLabel('🆔 ID Unique (GTA)').setStyle(TextInputStyle.Short).setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('age').setLabel('🎂 Âge HRP').setStyle(TextInputStyle.Short).setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('dispo').setLabel('📅 Disponibilités (jours/horaires)').setStyle(TextInputStyle.Paragraph).setRequired(true)
+        ),
+      );
+      await interaction.showModal(modal);
+      return;
+    }
 
     // Nom du salon : emoji・pseudo (compatible Discord : pas d'espaces, min 1 car)
     const safeName    = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').slice(0, 24);
@@ -669,10 +746,10 @@ client.on('interactionCreate', async interaction => {
           title: `${option.emoji} Ticket — ${option.label.replace(/^\S+\s/, '')}`,
           color: 0x5bb8d4,
           description:
-            `Bienvenue <@${interaction.user.id}> ! 👋\n\n` +
-            `**Raison :** ${option.description}\n\n` +
-            `Un membre de l'équipe va prendre en charge ta demande dans les plus brefs délais.\n` +
-            `Merci de **détailler ta demande** dès maintenant ci-dessous.`,
+            `Bonjour <@${interaction.user.id}>,\n\n` +
+            `Votre demande a bien été reçue par l'**Agence Immobilière**.\n\n` +
+            `> **Objet :** ${option.description}\n\n` +
+            `Un agent de notre équipe prendra en charge votre requête dans les meilleurs délais. En attendant, merci de **détailler votre demande** ci-dessous afin que nous puissions vous apporter la meilleure réponse possible.`,
           fields: [
             { name: '📋 Statut', value: '⏳ En attente de prise en charge', inline: true },
           ],
@@ -697,6 +774,135 @@ client.on('interactionCreate', async interaction => {
   // BOUTONS — TICKETS
   // ════════════════════════════════════════════════
   if (interaction.isButton()) {
+
+    // ── RECRUTEMENT : ÉTAPE 2 (bouton → modal) ────
+    if (interaction.customId === 'recruit-step2-btn') {
+      const modal = new ModalBuilder().setCustomId('recruit-step2').setTitle('📩 Candidature — Étape 2/3');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('identite').setLabel('💗 Prénom & Nom RP').setStyle(TextInputStyle.Short).setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('naissance').setLabel('🎂 Date de naissance RP').setStyle(TextInputStyle.Short).setPlaceholder('JJ/MM/AAAA').setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('tel').setLabel('📱 Téléphone RP').setStyle(TextInputStyle.Short).setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('nationalite').setLabel('🌍 Nationalité RP').setStyle(TextInputStyle.Short).setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('metier').setLabel('💼 Profession actuelle RP').setStyle(TextInputStyle.Short).setRequired(true)
+        ),
+      );
+      await interaction.showModal(modal);
+    }
+
+    // ── RECRUTEMENT : ÉTAPE 3 (bouton → modal) ────
+    if (interaction.customId === 'recruit-step3-btn') {
+      const modal = new ModalBuilder().setCustomId('recruit-step3').setTitle('📩 Candidature — Étape 3/3');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('motivation').setLabel('✍️ Pourquoi rejoindre l\'Agence ?').setStyle(TextInputStyle.Paragraph).setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('pourquoi').setLabel('⭐ Qu\'est-ce qui vous distingue ?').setStyle(TextInputStyle.Paragraph).setRequired(true)
+        ),
+      );
+      await interaction.showModal(modal);
+    }
+
+    // ── RECRUTEMENT : ACCEPTER ─────────────────────
+    if (interaction.customId.startsWith('recruit-accept_')) {
+      if (!isPatron(interaction)) { await interaction.reply({ content: '❌ Réservé aux Patrons.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+
+      const userId = interaction.customId.split('_')[1];
+      const data   = candidatures[userId];
+
+      // Créer le salon ticket dans la catégorie
+      const safeName = (data?.identite || 'candidat').toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').slice(0, 24);
+      const permOverwrites = [
+        { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: userId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles] },
+        { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] },
+      ];
+      if (process.env.PATRON_ROLE_ID) {
+        permOverwrites.push({ id: process.env.PATRON_ROLE_ID, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] });
+      }
+
+      try {
+        const ticketChannel = await interaction.guild.channels.create({
+          name: `📩・${safeName}`,
+          type: ChannelType.GuildText,
+          parent: TICKET_CATEGORY_ID,
+          permissionOverwrites: permOverwrites,
+        });
+
+        const closeBtn = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('ticket-close').setLabel('Fermer le ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger)
+        );
+
+        await ticketChannel.send({
+          content: `<@${userId}>`,
+          embeds: [{
+            title: '✅ Candidature acceptée — Agence Immobilière',
+            color: 0x4caf50,
+            description:
+              `Bonjour <@${userId}>,\n\n` +
+              `Nous avons le plaisir de vous informer que votre candidature a été **acceptée** par notre équipe.\n\n` +
+              `Merci de nous transmettre les documents suivants pour finaliser votre dossier :\n\n` +
+              `🪪 **Carte d'identité RP**\n` +
+              `🚗 **Permis de conduire RP** (si applicable)\n` +
+              `📅 **Vos disponibilités in-game** pour un entretien`,
+            footer: { text: 'Agence Immobilière · Recrutement' },
+            timestamp: new Date().toISOString(),
+          }],
+          components: [closeBtn],
+        });
+
+        // Mettre à jour le message staff (désactiver les boutons)
+        const disabledRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('recruit-accept_x').setLabel('Accepté ✅').setStyle(ButtonStyle.Success).setDisabled(true),
+          new ButtonBuilder().setCustomId('recruit-refuse_x').setLabel('Refuser').setStyle(ButtonStyle.Danger).setDisabled(true),
+        );
+        await interaction.message.edit({ components: [disabledRow] });
+
+        await interaction.editReply({ content: `✅ Candidature acceptée. Ticket créé : <#${ticketChannel.id}>` });
+        delete candidatures[userId];
+
+      } catch (err) {
+        await interaction.editReply({ content: `❌ Erreur : ${err.message}` });
+      }
+    }
+
+    // ── RECRUTEMENT : REFUSER ──────────────────────
+    if (interaction.customId.startsWith('recruit-refuse_')) {
+      if (!isPatron(interaction)) { await interaction.reply({ content: '❌ Réservé aux Patrons.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+
+      const userId = interaction.customId.split('_')[1];
+      try {
+        const user = await client.users.fetch(userId);
+        await user.send({ embeds: [{
+          title: '❌ Candidature — Agence Immobilière',
+          color: 0xf44336,
+          description:
+            `Bonjour,\n\nNous avons bien examiné votre candidature et nous sommes au regret de vous informer qu'elle n'a pas été retenue à ce stade.\n\n` +
+            `Nous vous remercions pour l'intérêt que vous portez à l'Agence Immobilière et vous souhaitons bonne chance dans vos recherches.`,
+          footer: { text: 'Agence Immobilière · Recrutement' },
+        }]});
+      } catch { /* DMs fermés */ }
+
+      // Désactiver les boutons
+      const disabledRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('recruit-accept_x').setLabel('Accepter').setStyle(ButtonStyle.Success).setDisabled(true),
+        new ButtonBuilder().setCustomId('recruit-refuse_x').setLabel('Refusé ❌').setStyle(ButtonStyle.Danger).setDisabled(true),
+      );
+      await interaction.message.edit({ components: [disabledRow] });
+      await interaction.editReply({ content: '❌ Candidature refusée. Un DM a été envoyé au candidat.' });
+      delete candidatures[userId];
+    }
 
     // ── PRENDRE EN CHARGE ─────────────────────────
     if (interaction.customId === 'ticket-claim') {
@@ -776,6 +982,86 @@ client.on('interactionCreate', async interaction => {
   // MODAL SUBMITS
   // ════════════════════════════════════════════════
   if (interaction.isModalSubmit()) {
+
+    // ── MODAL RECRUIT ÉTAPE 1 ─────────────────────
+    if (interaction.customId === 'recruit-step1') {
+      candidatures[interaction.user.id] = {
+        pseudo: interaction.fields.getTextInputValue('pseudo'),
+        id:     interaction.fields.getTextInputValue('id'),
+        age:    interaction.fields.getTextInputValue('age'),
+        dispo:  interaction.fields.getTextInputValue('dispo'),
+      };
+      const d = candidatures[interaction.user.id];
+      await interaction.reply({
+        embeds: [{
+          title: '📋 Récapitulatif — Étape 1/3',
+          color: 0x5bb8d4,
+          fields: [
+            { name: '👤 Pseudo Discord', value: d.pseudo, inline: true },
+            { name: '🆔 ID Unique',      value: d.id,     inline: true },
+            { name: '🎂 Âge HRP',        value: d.age,    inline: true },
+            { name: '📅 Disponibilités', value: d.dispo,  inline: false },
+          ],
+          footer: { text: 'Agence Immobilière · Recrutement — Étape 1/3' },
+        }],
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('recruit-step2-btn').setLabel('Étape suivante →').setEmoji('📝').setStyle(ButtonStyle.Primary)
+        )],
+        ephemeral: true,
+      });
+    }
+
+    // ── MODAL RECRUIT ÉTAPE 2 ─────────────────────
+    if (interaction.customId === 'recruit-step2') {
+      const d = candidatures[interaction.user.id] || {};
+      d.identite   = interaction.fields.getTextInputValue('identite');
+      d.naissance  = interaction.fields.getTextInputValue('naissance');
+      d.tel        = interaction.fields.getTextInputValue('tel');
+      d.nationalite= interaction.fields.getTextInputValue('nationalite');
+      d.metier     = interaction.fields.getTextInputValue('metier');
+      candidatures[interaction.user.id] = d;
+      await interaction.reply({
+        embeds: [{
+          title: '📋 Récapitulatif — Étape 2/3',
+          color: 0x5bb8d4,
+          fields: [
+            { name: '💗 Identité RP',        value: d.identite,    inline: true },
+            { name: '🎂 Date de naissance',   value: d.naissance,   inline: true },
+            { name: '📱 Téléphone RP',        value: d.tel,         inline: true },
+            { name: '🌍 Nationalité',         value: d.nationalite, inline: true },
+            { name: '💼 Profession actuelle', value: d.metier,      inline: true },
+          ],
+          footer: { text: 'Agence Immobilière · Recrutement — Étape 2/3' },
+        }],
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('recruit-step3-btn').setLabel('Étape finale →').setEmoji('⭐').setStyle(ButtonStyle.Primary)
+        )],
+        ephemeral: true,
+      });
+    }
+
+    // ── MODAL RECRUIT ÉTAPE 3 ─────────────────────
+    if (interaction.customId === 'recruit-step3') {
+      const d = candidatures[interaction.user.id] || {};
+      d.motivation = interaction.fields.getTextInputValue('motivation');
+      d.pourquoi   = interaction.fields.getTextInputValue('pourquoi');
+      candidatures[interaction.user.id] = d;
+
+      // Menu select permis de conduire
+      const permisMenu = new StringSelectMenuBuilder()
+        .setCustomId('recruit-permis')
+        .setPlaceholder('Avez-vous le permis de conduire RP ?')
+        .addOptions(
+          new StringSelectMenuOptionBuilder().setLabel('✅ Oui, j\'ai le permis').setValue('oui'),
+          new StringSelectMenuOptionBuilder().setLabel('❌ Non, je n\'ai pas le permis').setValue('non'),
+        );
+
+      await interaction.reply({
+        content: '🚗 **Dernière question** — Êtes-vous titulaire du permis de conduire RP ?',
+        components: [new ActionRowBuilder().addComponents(permisMenu)],
+        ephemeral: true,
+      });
+    }
 
     // ── MODAL AVIS ────────────────────────────────
     if (interaction.customId === 'modal-avis') {
