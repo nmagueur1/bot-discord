@@ -41,6 +41,11 @@ const ANNONCES_CHANNEL_ID  = '1488696390933680139'; // Salon annonces
 const NEWS_CHANNEL_ID      = '1488696763337674852'; // Salon news / nouveautés
 const TICKET_CATEGORY_ID       = '1488703536739909722'; // Catégorie où créer les salons de ticket
 const RECRUTEMENT_STAFF_ID     = '1488710114687979660'; // Salon staff pour examiner les candidatures
+const BLACKLIST_ROLE_ID        = '1486188383960039538'; // Rôle blacklist
+const TICKET_LOG_CHANNEL_ID    = '1488714560243499018'; // Salon logs fermeture tickets
+
+// ── SUIVI TICKETS INACTIFS ────────────────────────
+const warnedTickets = new Set();
 
 // ── STORE CANDIDATURES (en mémoire) ──────────────
 const candidatures = {};
@@ -108,6 +113,15 @@ const commands = [
   new SlashCommandBuilder().setName('news').setDescription('👑 [Patron] Publier une nouveauté pour les clients'),
   new SlashCommandBuilder().setName('ticket-setup').setDescription('👑 [Patron] Poste le panneau de création de tickets dans ce salon'),
   new SlashCommandBuilder().setName('avis').setDescription('Laisser un avis sur l\'Agence Immobilière'),
+  new SlashCommandBuilder()
+    .setName('blacklist')
+    .setDescription('👑 [Patron] Gérer la blacklist')
+    .addSubcommand(s => s.setName('add').setDescription('Ajouter un membre à la blacklist')
+      .addUserOption(o => o.setName('membre').setDescription('Membre à blacklister').setRequired(true))
+      .addStringOption(o => o.setName('raison').setDescription('Raison de la blacklist').setRequired(true)))
+    .addSubcommand(s => s.setName('remove').setDescription('Retirer un membre de la blacklist')
+      .addUserOption(o => o.setName('membre').setDescription('Membre à retirer').setRequired(true)))
+    .addSubcommand(s => s.setName('liste').setDescription('Afficher la blacklist')),
 ];
 
 // ── REGISTER ──────────────────────────────────────
@@ -131,6 +145,7 @@ const client = new Client({
 // ── READY : listener journal Firestore ───────────
 client.once('ready', async () => {
   console.log(`✅ Bot connecté : ${client.user.tag}`);
+  startAutoCloseInterval();
 
   // Charger les IDs existants pour ne pas les reposter au démarrage
   try {
@@ -204,6 +219,117 @@ client.on('guildMemberAdd', async member => {
     timestamp: new Date().toISOString(),
   }]});
 });
+
+// ── HELPER : FERMETURE DE TICKET ─────────────────
+async function closeTicketChannel(channel, closedByName = 'Automatique') {
+  try {
+    // Récupérer l'ID de l'ouvreur depuis le topic
+    const topicMatch = channel.topic ? channel.topic.match(/opener:(\d+)/) : null;
+    const openerId   = topicMatch ? topicMatch[1] : null;
+
+    // Durée du ticket
+    const duration = Date.now() - channel.createdTimestamp;
+    const hours    = Math.floor(duration / 3600000);
+    const minutes  = Math.floor((duration % 3600000) / 60000);
+
+    // Trouver l'agent ayant pris en charge (depuis le 1er embed du bot)
+    let claimedBy = 'Non pris en charge';
+    try {
+      const msgs = await channel.messages.fetch({ limit: 50 });
+      const claimMsg = msgs.find(m => m.author.bot && m.embeds[0]?.fields?.some(f => f.name === '🙋 Agent assigné'));
+      if (claimMsg) {
+        const field = claimMsg.embeds[0].fields.find(f => f.name === '🙋 Agent assigné');
+        if (field) claimedBy = field.value.replace(/\*\*/g, '');
+      }
+    } catch { /* ignore */ }
+
+    // ── LOG CHANNEL ────────────────────────────
+    try {
+      const logCh = await client.channels.fetch(TICKET_LOG_CHANNEL_ID);
+      if (logCh) {
+        await logCh.send({ embeds: [{
+          title: `🔒 Ticket fermé — ${channel.name}`,
+          color: 0xf44336,
+          fields: [
+            { name: '📁 Salon',             value: `\`${channel.name}\``,                    inline: true },
+            { name: '⏱ Durée',             value: `${hours}h ${minutes}min`,                inline: true },
+            { name: '🔒 Fermé par',         value: closedByName,                             inline: true },
+            { name: '👤 Ouvert par',        value: openerId ? `<@${openerId}>` : 'Inconnu', inline: true },
+            { name: '🙋 Pris en charge par',value: claimedBy,                               inline: true },
+          ],
+          timestamp: new Date().toISOString(),
+          footer: { text: 'Agence Immobilière · Logs tickets' },
+        }]});
+      }
+    } catch (e) { console.error('Erreur log ticket:', e.message); }
+
+    // ── DM À L'OUVREUR ────────────────────────
+    if (openerId) {
+      try {
+        const opener = await client.users.fetch(openerId);
+        await opener.send({ embeds: [{
+          title: '📬 Votre ticket a été clôturé — Agence Immobilière',
+          color: 0x5bb8d4,
+          description:
+            `Votre demande **${channel.name}** a bien été traitée et le ticket est maintenant fermé.\n\n` +
+            `Merci d'avoir contacté l'Agence Immobilière ! N'hésitez pas à utiliser \`/avis\` pour nous laisser un retour. ⭐`,
+          fields: [
+            { name: '⏱ Durée',  value: `${hours}h ${minutes}min`, inline: true },
+            { name: '🙋 Agent', value: claimedBy,                  inline: true },
+          ],
+          timestamp: new Date().toISOString(),
+          footer: { text: 'Agence Immobilière · Système de tickets' },
+        }]});
+      } catch { /* DMs fermés */ }
+    }
+
+    warnedTickets.delete(channel.id);
+    setTimeout(() => channel.delete().catch(() => {}), 4000);
+
+  } catch (err) {
+    console.error('Erreur closeTicketChannel:', err.message);
+  }
+}
+
+// ── AUTO-CLOSE : vérification toutes les 30 min ──
+function startAutoCloseInterval() {
+  setInterval(async () => {
+    const guild = client.guilds.cache.get(process.env.GUILD_ID);
+    if (!guild) return;
+
+    const ticketChannels = guild.channels.cache.filter(
+      c => c.parentId === TICKET_CATEGORY_ID && c.type === ChannelType.GuildText
+    );
+
+    const now = Date.now();
+    const WARN_MS  = 23 * 60 * 60 * 1000;
+    const CLOSE_MS = 24 * 60 * 60 * 1000;
+
+    for (const [, ch] of ticketChannels) {
+      try {
+        const msgs = await ch.messages.fetch({ limit: 1 });
+        const lastMsg = msgs.first();
+        const lastTs  = lastMsg ? lastMsg.createdTimestamp : ch.createdTimestamp;
+        const inactivity = now - lastTs;
+
+        if (inactivity >= CLOSE_MS) {
+          await ch.send({ embeds: [{
+            description: '⏰ Ce ticket a été **fermé automatiquement** après 24 heures d\'inactivité.',
+            color: 0xf44336,
+          }]});
+          await closeTicketChannel(ch, 'Auto (inactivité 24h)');
+
+        } else if (inactivity >= WARN_MS && !warnedTickets.has(ch.id)) {
+          warnedTickets.add(ch.id);
+          await ch.send({ embeds: [{
+            description: '⚠️ Aucune activité depuis **23 heures**. Ce ticket sera fermé automatiquement dans 1 heure si aucun message n\'est envoyé.',
+            color: 0xf4c542,
+          }]});
+        }
+      } catch { /* ignore */ }
+    }
+  }, 30 * 60 * 1000); // toutes les 30 minutes
+}
 
 // ════════════════════════════════════════════════
 // SLASH COMMANDS
@@ -453,6 +579,96 @@ client.on('interactionCreate', async interaction => {
         ),
       );
       await interaction.showModal(modal);
+    }
+
+    // ── BLACKLIST ──────────────────────────────────
+    if (interaction.commandName === 'blacklist') {
+      if (!isPatron(interaction)) { await interaction.reply({ content: '❌ Réservé aux Patrons.', ephemeral: true }); return; }
+      const sub = interaction.options.getSubcommand();
+
+      // ── ADD ──
+      if (sub === 'add') {
+        const cible  = interaction.options.getUser('membre');
+        const raison = interaction.options.getString('raison');
+        const member = await interaction.guild.members.fetch(cible.id).catch(() => null);
+
+        const snap = await getDoc(REF);
+        const data = snap.data();
+        data.blacklist = data.blacklist || [];
+
+        if (data.blacklist.find(b => b.userId === cible.id)) {
+          await interaction.reply({ content: `⚠️ **${cible.displayName}** est déjà blacklisté.`, ephemeral: true });
+          return;
+        }
+
+        data.blacklist.push({ userId: cible.id, pseudo: cible.username, raison, date: Date.now(), addedBy: interaction.user.username });
+        await setDoc(REF, data);
+
+        if (member) await member.roles.add(BLACKLIST_ROLE_ID).catch(() => {});
+
+        await interaction.reply({ embeds: [{
+          title: '🚫 Membre blacklisté',
+          color: 0xf44336,
+          fields: [
+            { name: '👤 Membre',  value: `<@${cible.id}>`,                   inline: true },
+            { name: '📋 Raison', value: raison,                              inline: true },
+            { name: '👑 Par',    value: interaction.user.displayName,        inline: true },
+          ],
+          timestamp: new Date().toISOString(),
+          footer: { text: 'Agence Immobilière · Blacklist' },
+        }]});
+      }
+
+      // ── REMOVE ──
+      if (sub === 'remove') {
+        const cible  = interaction.options.getUser('membre');
+        const member = await interaction.guild.members.fetch(cible.id).catch(() => null);
+
+        const snap = await getDoc(REF);
+        const data = snap.data();
+        data.blacklist = data.blacklist || [];
+        const before = data.blacklist.length;
+        data.blacklist = data.blacklist.filter(b => b.userId !== cible.id);
+
+        if (data.blacklist.length === before) {
+          await interaction.reply({ content: `⚠️ **${cible.username}** n'est pas dans la blacklist.`, ephemeral: true });
+          return;
+        }
+
+        await setDoc(REF, data);
+        if (member) await member.roles.remove(BLACKLIST_ROLE_ID).catch(() => {});
+
+        await interaction.reply({ embeds: [{
+          title: '✅ Membre retiré de la blacklist',
+          color: 0x4caf50,
+          description: `<@${cible.id}> a été retiré de la blacklist.`,
+          footer: { text: 'Agence Immobilière · Blacklist' },
+        }]});
+      }
+
+      // ── LISTE ──
+      if (sub === 'liste') {
+        const snap = await getDoc(REF);
+        const data = snap.data();
+        const bl   = data.blacklist || [];
+
+        if (!bl.length) {
+          await interaction.reply({ embeds: [{ title: '🚫 Blacklist', color: 0x5bb8d4, description: 'Aucun membre blacklisté.', footer: { text: 'Agence Immobilière · Blacklist' } }], ephemeral: true });
+          return;
+        }
+
+        const lignes = bl.map((b, i) => {
+          const dateStr = new Date(b.date).toLocaleDateString('fr-FR');
+          return `**${i+1}.** <@${b.userId}> — ${b.raison}\n> Ajouté par ${b.addedBy} le ${dateStr}`;
+        }).join('\n\n');
+
+        await interaction.reply({ embeds: [{
+          title: `🚫 Blacklist — ${bl.length} membre(s)`,
+          color: 0xf44336,
+          description: lignes,
+          footer: { text: 'Agence Immobilière · Blacklist' },
+        }], ephemeral: true });
+      }
     }
 
     // ── AVIS ───────────────────────────────────────
@@ -735,6 +951,7 @@ client.on('interactionCreate', async interaction => {
         name: channelName,
         type: ChannelType.GuildText,
         parent: TICKET_CATEGORY_ID,
+        topic: `opener:${interaction.user.id}`,
         permissionOverwrites: permOverwrites,
       });
 
@@ -745,6 +962,11 @@ client.on('interactionCreate', async interaction => {
           .setLabel('Prendre en charge')
           .setEmoji('🙋')
           .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('ticket-rdv')
+          .setLabel('Prendre un rendez-vous')
+          .setEmoji('📅')
+          .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
           .setCustomId('ticket-close')
           .setLabel('Fermer le ticket')
@@ -917,6 +1139,29 @@ client.on('interactionCreate', async interaction => {
       delete candidatures[userId];
     }
 
+    // ── PRISE DE RENDEZ-VOUS ──────────────────────
+    if (interaction.customId === 'ticket-rdv') {
+      const modal = new ModalBuilder().setCustomId('modal-rdv').setTitle('📅 Prise de rendez-vous');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('ig').setLabel('🎮 Numéro IG (obligatoire)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 1234')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('identite').setLabel('💗 Prénom & Nom RP').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Jonathan Wise')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('date').setLabel('📆 Date souhaitée').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Samedi 05/04')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('heure').setLabel('🕐 Heure souhaitée').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 19h00 – 21h00')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('infos').setLabel('📝 Informations complémentaires').setStyle(TextInputStyle.Paragraph).setRequired(false).setPlaceholder('Type de bien, budget, questions...')
+        ),
+      );
+      await interaction.showModal(modal);
+    }
+
     // ── PRENDRE EN CHARGE ─────────────────────────
     if (interaction.customId === 'ticket-claim') {
       if (!isPatron(interaction)) {
@@ -961,33 +1206,20 @@ client.on('interactionCreate', async interaction => {
 
     // ── FERMER LE TICKET ──────────────────────────
     if (interaction.customId === 'ticket-close') {
-      // Désactiver les deux boutons immédiatement
+      // Désactiver tous les boutons immédiatement
       const disabledButtons = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId('ticket-claim')
-          .setLabel('Pris en charge')
-          .setEmoji('✅')
-          .setStyle(ButtonStyle.Success)
-          .setDisabled(true),
-        new ButtonBuilder()
-          .setCustomId('ticket-close')
-          .setLabel('Fermer le ticket')
-          .setEmoji('🔒')
-          .setStyle(ButtonStyle.Danger)
-          .setDisabled(true),
+        new ButtonBuilder().setCustomId('ticket-claim').setLabel('Pris en charge').setEmoji('✅').setStyle(ButtonStyle.Success).setDisabled(true),
+        new ButtonBuilder().setCustomId('ticket-rdv').setLabel('Rendez-vous').setEmoji('📅').setStyle(ButtonStyle.Secondary).setDisabled(true),
+        new ButtonBuilder().setCustomId('ticket-close').setLabel('Fermer le ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger).setDisabled(true),
       );
-      await interaction.message.edit({ components: [disabledButtons] });
+      await interaction.message.edit({ components: [disabledButtons] }).catch(() => {});
 
-      await interaction.reply({
-        embeds: [{
-          description: `🔒 Ticket fermé par **${interaction.user.displayName}**. Suppression dans 5 secondes...`,
-          color: 0xf44336,
-        }]
-      });
+      await interaction.reply({ embeds: [{
+        description: `🔒 Ticket fermé par **${interaction.user.displayName}**. Suppression dans quelques secondes...`,
+        color: 0xf44336,
+      }]});
 
-      setTimeout(async () => {
-        await interaction.channel.delete().catch(() => {});
-      }, 5000);
+      await closeTicketChannel(interaction.channel, interaction.user.displayName);
     }
   }
 
@@ -995,6 +1227,32 @@ client.on('interactionCreate', async interaction => {
   // MODAL SUBMITS
   // ════════════════════════════════════════════════
   if (interaction.isModalSubmit()) {
+
+    // ── MODAL RDV ─────────────────────────────────
+    if (interaction.customId === 'modal-rdv') {
+      const ig       = interaction.fields.getTextInputValue('ig').trim();
+      const identite = interaction.fields.getTextInputValue('identite').trim();
+      const date     = interaction.fields.getTextInputValue('date').trim();
+      const heure    = interaction.fields.getTextInputValue('heure').trim();
+      const infos    = interaction.fields.getTextInputValue('infos').trim();
+
+      await interaction.channel.send({ embeds: [{
+        title: '📅 Demande de rendez-vous',
+        color: 0x5bb8d4,
+        fields: [
+          { name: '🎮 Numéro IG',                value: `**${ig}**`,   inline: true  },
+          { name: '💗 Identité RP',              value: identite,       inline: true  },
+          { name: '📆 Date souhaitée',           value: date,           inline: true  },
+          { name: '🕐 Heure souhaitée',          value: heure,          inline: true  },
+          ...(infos ? [{ name: '📝 Informations complémentaires', value: infos, inline: false }] : []),
+        ],
+        thumbnail: { url: interaction.user.displayAvatarURL({ dynamic: true }) },
+        timestamp: new Date().toISOString(),
+        footer: { text: `Demande de ${interaction.user.displayName} · Agence Immobilière` },
+      }]});
+
+      await interaction.reply({ content: '✅ Ta demande de rendez-vous a été postée dans le ticket. Un agent reviendra vers toi rapidement !', ephemeral: true });
+    }
 
     // ── MODAL RECRUIT ÉTAPE 1 ─────────────────────
     if (interaction.customId === 'recruit-step1') {
