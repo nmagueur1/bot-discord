@@ -53,11 +53,12 @@ const AVIS_CHANNEL_ID      = '1488696917084082187'; // Salon où poster les avis
 
 // ── OPTIONS TICKETS ───────────────────────────────
 const TICKET_OPTIONS = [
-  { label: '❓ Question',    value: 'question',    emoji: '❓', description: 'J\'ai une question à vous poser.' },
-  { label: '💰 Achat',       value: 'achat',       emoji: '💰', description: 'J\'ai un achat à faire.' },
-  { label: '📩 Recrutement', value: 'recrutement', emoji: '📩', description: 'Je souhaite vous transmettre mon CV.' },
-  { label: '🔑 Problème',    value: 'probleme',    emoji: '🔑', description: 'J\'ai besoin de vous pour régler un souci.' },
-  { label: '🚫 Annuler',     value: 'annuler',     emoji: '🚫', description: 'J\'ai changé d\'avis.' },
+  { label: '❓ Question',       value: 'question',    emoji: '❓', description: 'J\'ai une question à vous poser.' },
+  { label: '💰 Achat',          value: 'achat',       emoji: '💰', description: 'J\'ai un achat à faire.' },
+  { label: '📅 Rendez-vous',    value: 'rdv',         emoji: '📅', description: 'Je souhaite prendre un rendez-vous.' },
+  { label: '📩 Recrutement',    value: 'recrutement', emoji: '📩', description: 'Je souhaite vous transmettre mon CV.' },
+  { label: '🔑 Problème',       value: 'probleme',    emoji: '🔑', description: 'J\'ai besoin de vous pour régler un souci.' },
+  { label: '🚫 Annuler',        value: 'annuler',     emoji: '🚫', description: 'J\'ai changé d\'avis.' },
 ];
 
 // ── MESSAGES D'ACCUEIL (rotation aléatoire) ──────
@@ -868,6 +869,30 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
+    // ── CAS RDV : modal direct ─────────────────────
+    if (val === 'rdv') {
+      const modal = new ModalBuilder().setCustomId('modal-rdv').setTitle('📅 Prise de rendez-vous');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('ig').setLabel('🎮 Numéro IG (obligatoire)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 1234')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('identite').setLabel('💗 Prénom & Nom RP').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Jonathan Wise')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('date').setLabel('📆 Date souhaitée').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Samedi 05/04')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('heure').setLabel('🕐 Heure souhaitée').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 19h00 – 21h00')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('infos').setLabel('📝 Informations complémentaires').setStyle(TextInputStyle.Paragraph).setRequired(false).setPlaceholder('Type de bien, budget, questions...')
+        ),
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
     // ── CAS RECRUTEMENT : formulaire multi-étapes ──
     if (val === 'recrutement') {
       const modal = new ModalBuilder()
@@ -962,11 +987,6 @@ client.on('interactionCreate', async interaction => {
           .setLabel('Prendre en charge')
           .setEmoji('🙋')
           .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-          .setCustomId('ticket-rdv')
-          .setLabel('Prendre un rendez-vous')
-          .setEmoji('📅')
-          .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
           .setCustomId('ticket-close')
           .setLabel('Fermer le ticket')
@@ -1139,29 +1159,6 @@ client.on('interactionCreate', async interaction => {
       delete candidatures[userId];
     }
 
-    // ── PRISE DE RENDEZ-VOUS ──────────────────────
-    if (interaction.customId === 'ticket-rdv') {
-      const modal = new ModalBuilder().setCustomId('modal-rdv').setTitle('📅 Prise de rendez-vous');
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('ig').setLabel('🎮 Numéro IG (obligatoire)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 1234')
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('identite').setLabel('💗 Prénom & Nom RP').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Jonathan Wise')
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('date').setLabel('📆 Date souhaitée').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Samedi 05/04')
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('heure').setLabel('🕐 Heure souhaitée').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 19h00 – 21h00')
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('infos').setLabel('📝 Informations complémentaires').setStyle(TextInputStyle.Paragraph).setRequired(false).setPlaceholder('Type de bien, budget, questions...')
-        ),
-      );
-      await interaction.showModal(modal);
-    }
-
     // ── PRENDRE EN CHARGE ─────────────────────────
     if (interaction.customId === 'ticket-claim') {
       if (!isPatron(interaction)) {
@@ -1209,7 +1206,6 @@ client.on('interactionCreate', async interaction => {
       // Désactiver tous les boutons immédiatement
       const disabledButtons = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('ticket-claim').setLabel('Pris en charge').setEmoji('✅').setStyle(ButtonStyle.Success).setDisabled(true),
-        new ButtonBuilder().setCustomId('ticket-rdv').setLabel('Rendez-vous').setEmoji('📅').setStyle(ButtonStyle.Secondary).setDisabled(true),
         new ButtonBuilder().setCustomId('ticket-close').setLabel('Fermer le ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger).setDisabled(true),
       );
       await interaction.message.edit({ components: [disabledButtons] }).catch(() => {});
@@ -1236,22 +1232,58 @@ client.on('interactionCreate', async interaction => {
       const heure    = interaction.fields.getTextInputValue('heure').trim();
       const infos    = interaction.fields.getTextInputValue('infos').trim();
 
-      await interaction.channel.send({ embeds: [{
-        title: '📅 Demande de rendez-vous',
-        color: 0x5bb8d4,
-        fields: [
-          { name: '🎮 Numéro IG',                value: `**${ig}**`,   inline: true  },
-          { name: '💗 Identité RP',              value: identite,       inline: true  },
-          { name: '📆 Date souhaitée',           value: date,           inline: true  },
-          { name: '🕐 Heure souhaitée',          value: heure,          inline: true  },
-          ...(infos ? [{ name: '📝 Informations complémentaires', value: infos, inline: false }] : []),
-        ],
-        thumbnail: { url: interaction.user.displayAvatarURL({ dynamic: true }) },
-        timestamp: new Date().toISOString(),
-        footer: { text: `Demande de ${interaction.user.displayName} · Agence Immobilière` },
-      }]});
+      await interaction.deferReply({ ephemeral: true });
 
-      await interaction.reply({ content: '✅ Ta demande de rendez-vous a été postée dans le ticket. Un agent reviendra vers toi rapidement !', ephemeral: true });
+      // Créer le salon ticket pour ce RDV
+      const safeName = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').slice(0, 24);
+      const permOverwrites = [
+        { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles] },
+        { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] },
+      ];
+      if (process.env.PATRON_ROLE_ID) {
+        permOverwrites.push({ id: process.env.PATRON_ROLE_ID, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] });
+      }
+
+      try {
+        const ticketChannel = await interaction.guild.channels.create({
+          name: `📅・${safeName}`,
+          type: ChannelType.GuildText,
+          parent: TICKET_CATEGORY_ID,
+          topic: `opener:${interaction.user.id}`,
+          permissionOverwrites,
+        });
+
+        const ticketButtons = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('ticket-claim').setLabel('Prendre en charge').setEmoji('🙋').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('ticket-close').setLabel('Fermer le ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger),
+        );
+
+        await ticketChannel.send({
+          content: `<@${interaction.user.id}>`,
+          embeds: [{
+            title: '📅 Demande de rendez-vous',
+            color: 0x5bb8d4,
+            description: `Bonjour <@${interaction.user.id}>, votre demande de rendez-vous a bien été reçue.\nUn agent de l'Agence Immobilière vous contactera dans les meilleurs délais.`,
+            fields: [
+              { name: '🎮 Numéro IG',    value: `**${ig}**`, inline: true  },
+              { name: '💗 Identité RP',  value: identite,     inline: true  },
+              { name: '📆 Date',         value: date,         inline: true  },
+              { name: '🕐 Heure',        value: heure,        inline: true  },
+              ...(infos ? [{ name: '📝 Informations complémentaires', value: infos, inline: false }] : []),
+              { name: '📋 Statut', value: '⏳ En attente de prise en charge', inline: true },
+            ],
+            thumbnail: { url: interaction.user.displayAvatarURL({ dynamic: true }) },
+            timestamp: new Date().toISOString(),
+            footer: { text: 'Agence Immobilière · Système de tickets' },
+          }],
+          components: [ticketButtons],
+        });
+
+        await interaction.editReply({ content: `✅ Votre demande de rendez-vous a été enregistrée : <#${ticketChannel.id}>` });
+      } catch (err) {
+        await interaction.editReply({ content: `❌ Erreur : ${err.message}` });
+      }
     }
 
     // ── MODAL RECRUIT ÉTAPE 1 ─────────────────────
