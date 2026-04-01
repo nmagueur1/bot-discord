@@ -3,7 +3,7 @@ const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes,
         ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
         StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
 const { initializeApp } = require('firebase/app');
-const { getFirestore, doc, getDoc, setDoc } = require('firebase/firestore');
+const { getFirestore, doc, getDoc, setDoc, onSnapshot } = require('firebase/firestore');
 const admin = require('firebase-admin');
 
 // Parse le JSON depuis l'env
@@ -28,6 +28,27 @@ const firebaseConfig = {
 const fireApp = initializeApp(firebaseConfig);
 const db      = getFirestore(fireApp);
 const REF     = doc(db, 'famille', 'main');
+
+// ── SALONS ────────────────────────────────────────
+const LOGS_TABLETTE_ID    = '1488697548225908956'; // Journal depuis la tablette
+const LOGS_DISCORD_ID     = '1486169152459772005'; // Journal depuis le bot Discord
+const WELCOME_CHANNEL_ID  = '1488695814242045962'; // Salon d'arrivée des membres
+const REGLEMENT_CHANNEL_ID= '1486169077855813752'; // Salon règlement
+const TICKET_CHANNEL_ID   = '1334237812311982152'; // Salon tickets
+const ANNONCES_CHANNEL_ID = '1486169061531324620'; // Salon annonces / news
+
+// ── MESSAGES D'ACCUEIL (rotation aléatoire) ──────
+const WELCOME_MESSAGES = [
+  m => ({ msg: `Bienvenue <@${m.id}> dans l'Agence ! 🏠 N'hésite pas à consulter le règlement et à créer un ticket si tu as une demande.` }),
+  m => ({ msg: `🎉 <@${m.id}> vient de rejoindre le serveur ! On est ravis de t'accueillir, bonne aventure parmi nous.` }),
+  m => ({ msg: `🌟 Hey <@${m.id}>, tu as fait le bon choix ! Les portes de l'Agence Immobilière te sont grandes ouvertes.` }),
+  m => ({ msg: `🤝 <@${m.id}> débarque sur le serveur ! Le café est chaud et l'équipe est prête — bienvenue !` }),
+  m => ({ msg: `✨ Tout le monde applaudit pour <@${m.id}> qui nous rejoint aujourd'hui. Bienvenue à l'Agence !` }),
+  m => ({ msg: `🏡 <@${m.id}> a poussé la porte de l'Agence Immobilière. Nous sommes heureux de te compter parmi nous !` }),
+];
+
+// ── JOURNAL LISTENER (temps réel) ─────────────────
+const knownJournalIds = new Set();
 
 // ── HELPER PATRON ─────────────────────────────────
 function isPatron(interaction) {
@@ -56,8 +77,6 @@ const commands = [
     .setName('clean')
     .setDescription('👑 [Patron] Supprime les derniers messages du salon')
     .addIntegerOption(o => o.setName('nombre').setDescription('Nombre (1-100)').setRequired(true).setMinValue(1).setMaxValue(100)),
-
-  // ── NOUVELLES COMMANDES ───────────────────────────
   new SlashCommandBuilder()
     .setName('up')
     .setDescription('👑 [Patron] Passe un membre au statut Actif')
@@ -66,6 +85,9 @@ const commands = [
     .setName('down')
     .setDescription('👑 [Patron] Passe un membre au statut Absent')
     .addStringOption(o => o.setName('membre').setDescription('Nom du membre (tel qu\'il apparaît dans la tablette)').setRequired(true)),
+  new SlashCommandBuilder().setName('reglement').setDescription('👑 [Patron] Envoie le règlement dans le salon dédié'),
+  new SlashCommandBuilder().setName('annonce').setDescription('👑 [Patron] Créer une annonce dans le salon dédié'),
+  new SlashCommandBuilder().setName('news').setDescription('👑 [Patron] Publier une nouveauté pour les clients'),
 ];
 
 // ── REGISTER ──────────────────────────────────────
@@ -76,15 +98,92 @@ const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
 })();
 
 // ── CLIENT ────────────────────────────────────────
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages] });
+// NOTE : GuildMembers est un intent privilégié — il doit être activé
+// dans le Discord Developer Portal (Bot → Privileged Gateway Intents)
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.DirectMessages,
+  ]
+});
 
-client.once('ready', () => console.log(`✅ Bot connecté : ${client.user.tag}`));
+// ── READY : listener journal Firestore ───────────
+client.once('ready', async () => {
+  console.log(`✅ Bot connecté : ${client.user.tag}`);
 
+  // Charger les IDs existants pour ne pas les reposter au démarrage
+  try {
+    const snap = await getDoc(REF);
+    const initData = snap.data();
+    if (initData?.journal) {
+      initData.journal.forEach(e => knownJournalIds.add(e.id));
+    }
+    console.log(`📓 ${knownJournalIds.size} entrées journal chargées`);
+  } catch (err) {
+    console.error('Erreur chargement journal initial :', err.message);
+  }
+
+  // Écoute en temps réel : nouvelles entrées → salon de logs
+  onSnapshot(REF, async (docSnap) => {
+    const data = docSnap.data();
+    if (!data?.journal) return;
+
+    const newEntries = data.journal
+      .filter(e => !knownJournalIds.has(e.id))
+      .sort((a, b) => a.ts - b.ts);
+
+    if (!newEntries.length) return;
+
+    for (const entry of newEntries) {
+      knownJournalIds.add(entry.id);
+
+      // Choisir le bon salon selon l'origine
+      const isDiscordEntry = entry.auteur === 'Bot Discord';
+      const channelId = isDiscordEntry ? LOGS_DISCORD_ID : LOGS_TABLETTE_ID;
+      const logChannel = client.channels.cache.get(channelId);
+
+      if (!logChannel) {
+        console.warn(`⚠️ Salon de logs introuvable : ${channelId}`);
+        continue;
+      }
+
+      await logChannel.send({ embeds: [{
+        title: `📓 ${entry.titre}`,
+        color: isDiscordEntry ? 0x5bb8d4 : 0x4caf50,
+        description: entry.contenu || '*Aucun contenu*',
+        fields: [
+          ...(entry.tags?.length ? [{ name: '🏷 Tags', value: entry.tags.join(', '), inline: true }] : []),
+          ...(entry.auteur     ? [{ name: '✍️ Auteur', value: entry.auteur, inline: true }] : []),
+        ],
+        timestamp: new Date(entry.ts).toISOString(),
+        footer: { text: isDiscordEntry ? 'Log Discord · Agence' : 'Log Tablette · Agence' }
+      }]});
+    }
+  });
+});
+
+// ── ARRIVÉE D'UN MEMBRE ───────────────────────────
+client.on('guildMemberAdd', async member => {
+  const channel = client.channels.cache.get(WELCOME_CHANNEL_ID);
+  if (!channel) return;
+
+  const pick = WELCOME_MESSAGES[Math.floor(Math.random() * WELCOME_MESSAGES.length)](member);
+
+  await channel.send({ embeds: [{
+    description: pick.msg,
+    color: 0x5bb8d4,
+    thumbnail: { url: member.user.displayAvatarURL({ dynamic: true }) },
+    footer: { text: `Membre #${member.guild.memberCount} · Agence Immobilière` },
+    timestamp: new Date().toISOString(),
+  }]});
+});
+
+// ════════════════════════════════════════════════
+// SLASH COMMANDS
+// ════════════════════════════════════════════════
 client.on('interactionCreate', async interaction => {
 
-  // ════════════════════════════════════════════════
-  // SLASH COMMANDS
-  // ════════════════════════════════════════════════
   if (interaction.isChatInputCommand()) {
 
     // ── HELP ───────────────────────────────────────
@@ -104,7 +203,7 @@ client.on('interactionCreate', async interaction => {
           title: '📋 Aide — Choisir une catégorie',
           color: 0x5bb8d4,
           description: 'Sélectionne une catégorie ci-dessous pour voir les commandes disponibles.',
-          footer: { text: 'Tablette de gestion · Famille' }
+          footer: { text: 'Tablette de gestion · Agence Immobilière' }
         }],
         components: [new ActionRowBuilder().addComponents(select)],
         ephemeral: true
@@ -124,7 +223,7 @@ client.on('interactionCreate', async interaction => {
           { name: 'Objectif',    value: `${objectif} $`,   inline: true },
           { name: 'Progression', value: `${pct}%`,         inline: true },
         ],
-        footer: { text: 'Tablette de gestion · Famille' }
+        footer: { text: 'Tablette de gestion · Agence Immobilière' }
       }]});
     }
 
@@ -135,7 +234,7 @@ client.on('interactionCreate', async interaction => {
         const e = m.statut === 'actif' ? '🟢' : m.statut === 'absent' ? '🔴' : '⚪';
         return `${e} **${m.nom}** — ${m.role} · ${m.parts}`;
       }).join('\n');
-      await interaction.reply({ embeds: [{ title: '👥 Membres', color: 0x5bb8d4, description: lignes, footer: { text: 'Tablette de gestion · Famille' } }]});
+      await interaction.reply({ embeds: [{ title: '👥 Membres', color: 0x5bb8d4, description: lignes, footer: { text: 'Tablette de gestion · Agence Immobilière' } }]});
     }
 
     // ── MISSIONS ───────────────────────────────────
@@ -144,7 +243,7 @@ client.on('interactionCreate', async interaction => {
       const actives = data.missions.filter(m => !m.done);
       if (!actives.length) { await interaction.reply('Aucune mission active.'); return; }
       const lignes  = actives.map(m => `▸ **${m.titre}** — ${m.phase}`).join('\n');
-      await interaction.reply({ embeds: [{ title: '🎯 Missions actives', color: 0x5bb8d4, description: lignes, footer: { text: 'Tablette de gestion · Famille' } }]});
+      await interaction.reply({ embeds: [{ title: '🎯 Missions actives', color: 0x5bb8d4, description: lignes, footer: { text: 'Tablette de gestion · Agence Immobilière' } }]});
     }
 
     // ── JOURNAL ────────────────────────────────────
@@ -153,7 +252,7 @@ client.on('interactionCreate', async interaction => {
       const recent = [...data.journal].sort((a,b) => b.ts - a.ts).slice(0,5);
       if (!recent.length) { await interaction.reply('Aucune entrée.'); return; }
       const lignes = recent.map(e => `▸ **${e.titre}**\n${e.contenu}`).join('\n\n');
-      await interaction.reply({ embeds: [{ title: '📓 Journal — 5 dernières entrées', color: 0x5bb8d4, description: lignes, footer: { text: 'Tablette de gestion · Famille' } }]});
+      await interaction.reply({ embeds: [{ title: '📓 Journal — 5 dernières entrées', color: 0x5bb8d4, description: lignes, footer: { text: 'Tablette de gestion · Agence Immobilière' } }]});
     }
 
     // ── TABLETTE ───────────────────────────────────
@@ -161,7 +260,7 @@ client.on('interactionCreate', async interaction => {
       await interaction.reply({ embeds: [{
         title: '📱 Tablette de gestion', color: 0x5bb8d4,
         description: '[**Accéder à la tablette →**](https://comfy-snickerdoodle-dd1ffa.netlify.app/gate.html)',
-        footer: { text: 'Tablette de gestion · Famille' }
+        footer: { text: 'Tablette de gestion · Agence Immobilière' }
       }]});
     }
 
@@ -170,7 +269,7 @@ client.on('interactionCreate', async interaction => {
       await interaction.reply({ embeds: [{
         title: '📂 Dossier RP', color: 0x5bb8d4,
         description: '[**Accéder au dossier →**](https://polite-seahorse-5e93cb.netlify.app)',
-        footer: { text: 'Tablette de gestion · Famille' }
+        footer: { text: 'Tablette de gestion · Agence Immobilière' }
       }]});
     }
 
@@ -205,7 +304,7 @@ client.on('interactionCreate', async interaction => {
       try {
         const user = await admin.auth().getUserByEmail(email);
         await admin.auth().deleteUser(user.uid);
-        await interaction.reply({ embeds: [{ title: '🗑 Compte supprimé', color: 0xf44336, description: `Le compte **${email}** a été supprimé.`, footer: { text: 'Tablette de gestion · Famille' } }], ephemeral: true });
+        await interaction.reply({ embeds: [{ title: '🗑 Compte supprimé', color: 0xf44336, description: `Le compte **${email}** a été supprimé.`, footer: { text: 'Tablette de gestion · Agence Immobilière' } }], ephemeral: true });
       } catch(e) {
         await interaction.reply({ content: `❌ Erreur : ${e.message}`, ephemeral: true });
       }
@@ -250,7 +349,7 @@ client.on('interactionCreate', async interaction => {
             { name: 'Avant',  value: 'Membre',              inline: true },
             { name: 'Après',  value: 'Patron 👑',           inline: true },
           ],
-          footer: { text: 'Tablette de gestion · Famille' }
+          footer: { text: 'Tablette de gestion · Agence Immobilière' }
         }]});
       } catch(e) {
         await interaction.reply({ content: `❌ Erreur : ${e.message}`, ephemeral: true });
@@ -283,11 +382,69 @@ client.on('interactionCreate', async interaction => {
             { name: 'Avant',  value: 'Patron',              inline: true },
             { name: 'Après',  value: 'Membre 🔽',           inline: true },
           ],
-          footer: { text: 'Tablette de gestion · Famille' }
+          footer: { text: 'Tablette de gestion · Agence Immobilière' }
         }]});
       } catch(e) {
         await interaction.reply({ content: `❌ Erreur : ${e.message}`, ephemeral: true });
       }
+    }
+
+    // ── REGLEMENT — PATRON ONLY ───────────────────
+    if (interaction.commandName === 'reglement') {
+      if (!isPatron(interaction)) { await interaction.reply({ content: '❌ Réservé aux Patrons.', ephemeral: true }); return; }
+      const channel = client.channels.cache.get(REGLEMENT_CHANNEL_ID);
+      if (!channel) { await interaction.reply({ content: '❌ Salon règlement introuvable.', ephemeral: true }); return; }
+      await channel.send({ embeds: [{
+        title: '📋 Règlement — Agence Immobilière',
+        color: 0x5bb8d4,
+        description:
+          `1️⃣ **Respect** : aucun propos raciste, sexiste, homophobe ou irrespectueux ne sera accepté.\n\n` +
+          `2️⃣ **Pas d'auto-promo** sans accord d'un Staff (même en DM).\n\n` +
+          `3️⃣ Veuillez utiliser <#${TICKET_CHANNEL_ID}> pour créer un ticket et faire votre demande.\n\n` +
+          `4️⃣ Il est interdit de DM ou de ping un membre du Staff.\n\n` +
+          `5️⃣ Rendez-vous dans le général HRP pour des discussions HRP et général RP pour des discussions RP.\n\n` +
+          `6️⃣ **Consultez les messages épinglés** de chaque salon, on y apprend plein de trucs.\n\n` +
+          `7️⃣ **Favorisez les formes de politesse**, le respect de chacun, et évitez le langage SMS et d'écrire EN MAJUSCULES.\n\n` +
+          `8️⃣ Toutes formes de publicités, Spam/Flood, contenus illégaux et pornographiques sont formellement interdites.\n\n` +
+          `9️⃣ Tout manquement à ces règles entrainera automatiquement la radiation de votre compte discord du serveur Agence Immobilière | Wise FA.\n\n` +
+          `🔟 Les clauses du [règlement Wise](https://wise-fa.gitbook.io/wisefa/reglement-wisefa/reglement-hrp/reglement-discord) ne bénéficient pas d'exemption.`,
+        footer: { text: 'Agence Immobilière · Wise FA' },
+        timestamp: new Date().toISOString(),
+      }]});
+      await interaction.reply({ content: '✅ Règlement publié dans le salon dédié.', ephemeral: true });
+    }
+
+    // ── ANNONCE — PATRON ONLY (modal) ─────────────
+    if (interaction.commandName === 'annonce') {
+      if (!isPatron(interaction)) { await interaction.reply({ content: '❌ Réservé aux Patrons.', ephemeral: true }); return; }
+      const modal = new ModalBuilder().setCustomId('modal-annonce').setTitle('📢 Nouvelle annonce');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('titre').setLabel('Titre de l\'annonce').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Fermeture exceptionnelle')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('contenu').setLabel('Contenu').setStyle(TextInputStyle.Paragraph).setRequired(true).setPlaceholder('Rédigez votre annonce ici...')
+        ),
+      );
+      await interaction.showModal(modal);
+    }
+
+    // ── NEWS — PATRON ONLY (modal + image) ────────
+    if (interaction.commandName === 'news') {
+      if (!isPatron(interaction)) { await interaction.reply({ content: '❌ Réservé aux Patrons.', ephemeral: true }); return; }
+      const modal = new ModalBuilder().setCustomId('modal-news').setTitle('🌟 Nouvelle actualité');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('titre').setLabel('Titre').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Nouveau bien disponible !')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('contenu').setLabel('Description').setStyle(TextInputStyle.Paragraph).setRequired(true).setPlaceholder('Décrivez la nouveauté...')
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('image').setLabel('URL de l\'image').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('https://i.imgur.com/...')
+        ),
+      );
+      await interaction.showModal(modal);
     }
   }
 
@@ -327,11 +484,14 @@ client.on('interactionCreate', async interaction => {
           { name: '👑 /clean',            value: 'Supprime les X derniers messages du salon.', inline: false },
           { name: '🟢 /up [membre]',      value: 'Passe un membre au statut Actif sur la tablette.', inline: false },
           { name: '🔴 /down [membre]',    value: 'Passe un membre au statut Absent sur la tablette.', inline: false },
+          { name: '📋 /reglement',        value: 'Envoie le règlement dans le salon dédié.', inline: false },
+          { name: '📢 /annonce',          value: 'Crée une annonce dans le salon dédié (via formulaire).', inline: false },
+          { name: '🌟 /news',             value: 'Publie une nouveauté avec image (via formulaire).', inline: false },
         ]
       },
     };
     await interaction.update({
-      embeds: [{ ...embeds[val], footer: { text: 'Tablette de gestion · Famille' } }],
+      embeds: [{ ...embeds[val], footer: { text: 'Tablette de gestion · Agence Immobilière' } }],
       components: interaction.message.components
     });
   }
@@ -403,12 +563,52 @@ client.on('interactionCreate', async interaction => {
             { name: 'Email',  value: email,  inline: true },
           ],
           description: `Les identifiants ont été envoyés en DM à <@${discordId}>.`,
-          footer: { text: 'Tablette de gestion · Famille' }
+          footer: { text: 'Tablette de gestion · Agence Immobilière' }
         }], ephemeral: true });
 
       } catch(e) {
         await interaction.reply({ content: `❌ Erreur : ${e.message}`, ephemeral: true });
       }
+    }
+
+    // ── MODAL ANNONCE ──────────────────────────────
+    if (interaction.customId === 'modal-annonce') {
+      const titre   = interaction.fields.getTextInputValue('titre').trim();
+      const contenu = interaction.fields.getTextInputValue('contenu').trim();
+
+      const channel = client.channels.cache.get(ANNONCES_CHANNEL_ID);
+      if (!channel) { await interaction.reply({ content: '❌ Salon annonces introuvable.', ephemeral: true }); return; }
+
+      await channel.send({ embeds: [{
+        title: `📢 ${titre}`,
+        color: 0x5bb8d4,
+        description: contenu,
+        timestamp: new Date().toISOString(),
+        footer: { text: `Annonce · ${interaction.user.displayName} · Agence Immobilière` },
+      }]});
+
+      await interaction.reply({ content: '✅ Annonce publiée dans le salon dédié.', ephemeral: true });
+    }
+
+    // ── MODAL NEWS ─────────────────────────────────
+    if (interaction.customId === 'modal-news') {
+      const titre   = interaction.fields.getTextInputValue('titre').trim();
+      const contenu = interaction.fields.getTextInputValue('contenu').trim();
+      const image   = interaction.fields.getTextInputValue('image').trim();
+
+      const channel = client.channels.cache.get(ANNONCES_CHANNEL_ID);
+      if (!channel) { await interaction.reply({ content: '❌ Salon annonces introuvable.', ephemeral: true }); return; }
+
+      await channel.send({ embeds: [{
+        title: `🌟 ${titre}`,
+        color: 0xf4c542,
+        description: contenu,
+        image: { url: image },
+        timestamp: new Date().toISOString(),
+        footer: { text: `Nouveauté · ${interaction.user.displayName} · Agence Immobilière` },
+      }]});
+
+      await interaction.reply({ content: '✅ Nouveauté publiée dans le salon dédié.', ephemeral: true });
     }
   }
 
