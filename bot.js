@@ -161,8 +161,14 @@ client.once('ready', async () => {
       // Choisir le bon salon selon l'origine
       const isDiscordEntry = entry.auteur === 'Bot Discord';
       const channelId = isDiscordEntry ? LOGS_DISCORD_ID : LOGS_TABLETTE_ID;
-      const logChannel = client.channels.cache.get(channelId);
 
+      let logChannel;
+      try {
+        logChannel = await client.channels.fetch(channelId);
+      } catch {
+        console.warn(`⚠️ Impossible de récupérer le salon de logs : ${channelId}`);
+        continue;
+      }
       if (!logChannel) {
         console.warn(`⚠️ Salon de logs introuvable : ${channelId}`);
         continue;
