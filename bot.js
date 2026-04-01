@@ -35,7 +35,8 @@ const LOGS_DISCORD_ID     = '1486169152459772005'; // Journal depuis le bot Disc
 const WELCOME_CHANNEL_ID  = '1488695814242045962'; // Salon d'arrivée des membres
 const REGLEMENT_CHANNEL_ID= '1486169077855813752'; // Salon règlement
 const TICKET_CHANNEL_ID   = '1488697077645971607'; // Salon tickets
-const ANNONCES_CHANNEL_ID = '1486169061531324620'; // Salon annonces / news
+const ANNONCES_CHANNEL_ID = '1488696390933680139'; // Salon annonces
+const NEWS_CHANNEL_ID     = '1488696763337674852'; // Salon news / nouveautés
 
 // ── MESSAGES D'ACCUEIL (rotation aléatoire) ──────
 const WELCOME_MESSAGES = [
@@ -596,8 +597,8 @@ client.on('interactionCreate', async interaction => {
       const contenu = interaction.fields.getTextInputValue('contenu').trim();
       const image   = interaction.fields.getTextInputValue('image').trim();
 
-      const channel = client.channels.cache.get(ANNONCES_CHANNEL_ID);
-      if (!channel) { await interaction.reply({ content: '❌ Salon annonces introuvable.', ephemeral: true }); return; }
+      const channel = client.channels.cache.get(NEWS_CHANNEL_ID);
+      if (!channel) { await interaction.reply({ content: '❌ Salon news introuvable.', ephemeral: true }); return; }
 
       await channel.send({ embeds: [{
         title: `🌟 ${titre}`,
