@@ -1,7 +1,8 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes,
         ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
-        StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
+        StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
+        ChannelType, PermissionFlagsBits } = require('discord.js');
 const { initializeApp } = require('firebase/app');
 const { getFirestore, doc, getDoc, setDoc, onSnapshot } = require('firebase/firestore');
 const admin = require('firebase-admin');
@@ -35,8 +36,18 @@ const LOGS_DISCORD_ID     = '1486169152459772005'; // Journal depuis le bot Disc
 const WELCOME_CHANNEL_ID  = '1488695814242045962'; // Salon d'arrivée des membres
 const REGLEMENT_CHANNEL_ID= '1486169077855813752'; // Salon règlement
 const TICKET_CHANNEL_ID   = '1488697077645971607'; // Salon tickets
-const ANNONCES_CHANNEL_ID = '1488696390933680139'; // Salon annonces
-const NEWS_CHANNEL_ID     = '1488696763337674852'; // Salon news / nouveautés
+const ANNONCES_CHANNEL_ID  = '1488696390933680139'; // Salon annonces
+const NEWS_CHANNEL_ID      = '1488696763337674852'; // Salon news / nouveautés
+const TICKET_CATEGORY_ID   = '1488703536739909722'; // Catégorie où créer les salons de ticket
+const AVIS_CHANNEL_ID      = '1488696917084082187'; // Salon où poster les avis clients
+
+// ── OPTIONS TICKETS ───────────────────────────────
+const TICKET_OPTIONS = [
+  { label: '❓ Question',    value: 'question',    emoji: '❓', description: 'J\'ai une question à vous poser.' },
+  { label: '💰 Achat',       value: 'achat',       emoji: '💰', description: 'J\'ai un achat à faire.' },
+  { label: '📩 Recrutement', value: 'recrutement', emoji: '📩', description: 'Je souhaite vous transmettre mon CV.' },
+  { label: '🔑 Problème',    value: 'probleme',    emoji: '🔑', description: 'J\'ai besoin de vous pour régler un souci.' },
+];
 
 // ── MESSAGES D'ACCUEIL (rotation aléatoire) ──────
 const WELCOME_MESSAGES = [
@@ -89,6 +100,8 @@ const commands = [
   new SlashCommandBuilder().setName('reglement').setDescription('👑 [Patron] Envoie le règlement dans le salon dédié'),
   new SlashCommandBuilder().setName('annonce').setDescription('👑 [Patron] Créer une annonce dans le salon dédié'),
   new SlashCommandBuilder().setName('news').setDescription('👑 [Patron] Publier une nouveauté pour les clients'),
+  new SlashCommandBuilder().setName('ticket-setup').setDescription('👑 [Patron] Poste le panneau de création de tickets dans ce salon'),
+  new SlashCommandBuilder().setName('avis').setDescription('Laisser un avis sur l\'Agence Immobilière'),
 ];
 
 // ── REGISTER ──────────────────────────────────────
@@ -430,6 +443,71 @@ client.on('interactionCreate', async interaction => {
       await interaction.showModal(modal);
     }
 
+    // ── AVIS ───────────────────────────────────────
+    if (interaction.commandName === 'avis') {
+      const modal = new ModalBuilder().setCustomId('modal-avis').setTitle('⭐ Laisser un avis');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('note')
+            .setLabel('Note globale (1 à 5 étoiles)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder('Ex : 5')
+            .setMinLength(1)
+            .setMaxLength(1)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('avis')
+            .setLabel('Votre avis')
+            .setStyle(TextInputStyle.Paragraph)
+            .setRequired(true)
+            .setPlaceholder('Décrivez votre expérience avec l\'Agence Immobilière...')
+            .setMaxLength(1000)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('agent')
+            .setLabel('Nom de l\'agent (optionnel)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setPlaceholder('Ex : Jonathan Wise')
+        ),
+      );
+      await interaction.showModal(modal);
+    }
+
+    // ── TICKET-SETUP — PATRON ONLY ────────────────
+    if (interaction.commandName === 'ticket-setup') {
+      if (!isPatron(interaction)) { await interaction.reply({ content: '❌ Réservé aux Patrons.', ephemeral: true }); return; }
+
+      const select = new StringSelectMenuBuilder()
+        .setCustomId('ticket-select')
+        .setPlaceholder('Sélectionne une raison de contact...')
+        .addOptions(TICKET_OPTIONS.map(o =>
+          new StringSelectMenuOptionBuilder()
+            .setLabel(o.label)
+            .setValue(o.value)
+            .setDescription(o.description)
+        ));
+
+      await interaction.channel.send({
+        embeds: [{
+          title: '🎫 Créer un ticket',
+          color: 0x5bb8d4,
+          description:
+            'Bienvenue ! Pour contacter l\'équipe de l\'Agence Immobilière, sélectionne la raison de ta demande dans le menu ci-dessous.\n\n' +
+            'Un salon privé sera automatiquement créé entre toi et notre équipe.\n\n' +
+            '> ⚠️ **Avertissement** : Tout abus du système de tickets (spam, fausses demandes, trolling) entraînera des sanctions immédiates pouvant aller jusqu\'à l\'exclusion du serveur.',
+          footer: { text: 'Agence Immobilière · Système de tickets' },
+        }],
+        components: [new ActionRowBuilder().addComponents(select)],
+      });
+
+      await interaction.reply({ content: '✅ Panneau de tickets posté.', ephemeral: true });
+    }
+
     // ── NEWS — PATRON ONLY (modal + image) ────────
     if (interaction.commandName === 'news') {
       if (!isPatron(interaction)) { await interaction.reply({ content: '❌ Réservé aux Patrons.', ephemeral: true }); return; }
@@ -462,6 +540,7 @@ client.on('interactionCreate', async interaction => {
           { name: '👥 /membres', value: 'Liste des membres et leur statut.', inline: false },
           { name: '🎯 /missions',value: 'Missions actives par phase.', inline: false },
           { name: '📓 /journal', value: '5 dernières entrées du journal.', inline: false },
+          { name: '⭐ /avis',    value: 'Laisser un avis sur l\'Agence Immobilière.', inline: false },
         ]
       },
       finances: {
@@ -488,6 +567,7 @@ client.on('interactionCreate', async interaction => {
           { name: '📋 /reglement',        value: 'Envoie le règlement dans le salon dédié.', inline: false },
           { name: '📢 /annonce',          value: 'Crée une annonce dans le salon dédié (via formulaire).', inline: false },
           { name: '🌟 /news',             value: 'Publie une nouveauté avec image (via formulaire).', inline: false },
+          { name: '🎫 /ticket-setup',     value: 'Poste le panneau de création de tickets dans le salon actuel.', inline: false },
         ]
       },
     };
@@ -498,9 +578,142 @@ client.on('interactionCreate', async interaction => {
   }
 
   // ════════════════════════════════════════════════
+  // SELECT MENU — TICKET
+  // ════════════════════════════════════════════════
+  if (interaction.isStringSelectMenu() && interaction.customId === 'ticket-select') {
+    const val    = interaction.values[0];
+    const option = TICKET_OPTIONS.find(o => o.value === val);
+
+    // Nom du salon : emoji・pseudo (compatible Discord : pas d'espaces, min 1 car)
+    const safeName    = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').slice(0, 24);
+    const channelName = `${option.emoji}・${safeName}`;
+
+    // Vérifier qu'un ticket n'est pas déjà ouvert pour cet utilisateur dans la catégorie
+    const category = interaction.guild.channels.cache.get(TICKET_CATEGORY_ID);
+    if (category) {
+      const existing = interaction.guild.channels.cache.find(
+        c => c.parentId === TICKET_CATEGORY_ID &&
+             c.permissionOverwrites.cache.has(interaction.user.id)
+      );
+      if (existing) {
+        await interaction.reply({
+          content: `❌ Tu as déjà un ticket ouvert : <#${existing.id}>. Merci de le clore avant d'en ouvrir un nouveau.`,
+          ephemeral: true
+        });
+        return;
+      }
+    }
+
+    // Créer le salon privé dans la catégorie tickets
+    try {
+      const permOverwrites = [
+        {
+          id: interaction.guild.id, // @everyone
+          deny: [PermissionFlagsBits.ViewChannel],
+        },
+        {
+          id: interaction.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+          ],
+        },
+        {
+          id: client.user.id,
+          allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels],
+        },
+      ];
+
+      // Donner accès au rôle Patron si défini
+      if (process.env.PATRON_ROLE_ID) {
+        permOverwrites.push({
+          id: process.env.PATRON_ROLE_ID,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.ManageMessages,
+            PermissionFlagsBits.AttachFiles,
+          ],
+        });
+      }
+
+      const ticketChannel = await interaction.guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildText,
+        parent: TICKET_CATEGORY_ID,
+        permissionOverwrites,
+      });
+
+      // Message d'accueil dans le ticket
+      await ticketChannel.send({
+        content: `<@${interaction.user.id}>`,
+        embeds: [{
+          title: `${option.emoji} Ticket — ${option.label.replace(/^\S+\s/, '')}`,
+          color: 0x5bb8d4,
+          description:
+            `Bienvenue <@${interaction.user.id}> ! 👋\n\n` +
+            `**Raison :** ${option.description}\n\n` +
+            `Un membre de l'équipe va prendre en charge ta demande dans les plus brefs délais.\n` +
+            `Merci de **détailler ta demande** dès maintenant ci-dessous.`,
+          footer: { text: 'Agence Immobilière · Système de tickets' },
+          timestamp: new Date().toISOString(),
+        }],
+      });
+
+      await interaction.reply({
+        content: `✅ Ton ticket a été créé : <#${ticketChannel.id}>`,
+        ephemeral: true,
+      });
+
+    } catch (err) {
+      console.error('Erreur création ticket :', err.message);
+      await interaction.reply({ content: `❌ Erreur lors de la création du ticket : ${err.message}`, ephemeral: true });
+    }
+  }
+
+  // ════════════════════════════════════════════════
   // MODAL SUBMITS
   // ════════════════════════════════════════════════
   if (interaction.isModalSubmit()) {
+
+    // ── MODAL AVIS ────────────────────────────────
+    if (interaction.customId === 'modal-avis') {
+      const noteRaw = interaction.fields.getTextInputValue('note').trim();
+      const avis    = interaction.fields.getTextInputValue('avis').trim();
+      const agent   = interaction.fields.getTextInputValue('agent').trim();
+
+      const note = parseInt(noteRaw);
+      if (isNaN(note) || note < 1 || note > 5) {
+        await interaction.reply({ content: '❌ La note doit être un chiffre entre **1** et **5**.', ephemeral: true });
+        return;
+      }
+
+      const etoiles  = '⭐'.repeat(note) + '☆'.repeat(5 - note);
+      const couleurs = [0xf44336, 0xff9800, 0xffc107, 0x8bc34a, 0x4caf50];
+      const couleur  = couleurs[note - 1];
+
+      const channel = client.channels.cache.get(AVIS_CHANNEL_ID);
+      if (!channel) { await interaction.reply({ content: '❌ Salon des avis introuvable.', ephemeral: true }); return; }
+
+      await channel.send({ embeds: [{
+        title: `${etoiles} — Avis client`,
+        color: couleur,
+        description: `*"${avis}"*`,
+        fields: [
+          { name: '⭐ Note',    value: `**${note}/5**`, inline: true },
+          { name: '👤 Client',  value: `<@${interaction.user.id}>`, inline: true },
+          ...(agent ? [{ name: '🤝 Agent', value: agent, inline: true }] : []),
+        ],
+        thumbnail: { url: interaction.user.displayAvatarURL({ dynamic: true }) },
+        timestamp: new Date().toISOString(),
+        footer: { text: 'Agence Immobilière · Avis clients' },
+      }]});
+
+      await interaction.reply({ content: '✅ Merci pour ton avis ! Il a bien été publié.', ephemeral: true });
+    }
 
     // ── MODAL TRANSACTION ──────────────────────────
     if (interaction.customId === 'modal-transaction') {
