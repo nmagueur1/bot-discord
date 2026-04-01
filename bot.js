@@ -3,7 +3,7 @@ const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes,
         ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
         StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
         ChannelType, PermissionFlagsBits,
-        ButtonBuilder, ButtonStyle } = require('discord.js');
+        ButtonBuilder, ButtonStyle, Partials } = require('discord.js');
 const { initializeApp } = require('firebase/app');
 const { getFirestore, doc, getDoc, setDoc, onSnapshot } = require('firebase/firestore');
 const admin = require('firebase-admin');
@@ -29,27 +29,39 @@ const firebaseConfig = {
 
 const fireApp = initializeApp(firebaseConfig);
 const db      = getFirestore(fireApp);
-const REF     = doc(db, 'famille', 'main');
+const REF            = doc(db, 'famille', 'main');
+const ROLE_REACT_REF = doc(db, 'bot', 'roleReact');
 
 // ── SALONS ────────────────────────────────────────
-const LOGS_TABLETTE_ID    = '1488697548225908956'; // Journal depuis la tablette
-const LOGS_DISCORD_ID     = '1486169152459772005'; // Journal depuis le bot Discord
-const WELCOME_CHANNEL_ID  = '1488695814242045962'; // Salon d'arrivée des membres
-const REGLEMENT_CHANNEL_ID= '1486169077855813752'; // Salon règlement
-const TICKET_CHANNEL_ID   = '1488697077645971607'; // Salon tickets
+const LOGS_TABLETTE_ID     = '1488697548225908956'; // Journal depuis la tablette
+const LOGS_DISCORD_ID      = '1486169152459772005'; // Journal depuis le bot Discord
+const WELCOME_CHANNEL_ID   = '1488695814242045962'; // Salon d'arrivée des membres
+const REGLEMENT_CHANNEL_ID = '1486169077855813752'; // Salon règlement
+const TICKET_CHANNEL_ID    = '1488697077645971607'; // Salon tickets
 const ANNONCES_CHANNEL_ID  = '1488696390933680139'; // Salon annonces
 const NEWS_CHANNEL_ID      = '1488696763337674852'; // Salon news / nouveautés
-const TICKET_CATEGORY_ID       = '1488703536739909722'; // Catégorie où créer les salons de ticket
-const RECRUTEMENT_STAFF_ID     = '1488710114687979660'; // Salon staff pour examiner les candidatures
-const BLACKLIST_ROLE_ID        = '1486188383960039538'; // Rôle blacklist
-const TICKET_LOG_CHANNEL_ID    = '1488714560243499018'; // Salon logs fermeture tickets
+const TICKET_CATEGORY_ID   = '1488703536739909722'; // Catégorie où créer les salons de ticket
+const RECRUTEMENT_STAFF_ID = '1488710114687979660'; // Salon staff pour examiner les candidatures
+const BLACKLIST_ROLE_ID    = '1486188383960039538'; // Rôle blacklist
+const TICKET_LOG_CHANNEL_ID= '1488714560243499018'; // Salon logs fermeture tickets
+
+// ── RÔLES ─────────────────────────────────────────
+const AGENT_ROLE_ID = '1488693237794209946'; // Rôle Agent
 
 // ── SUIVI TICKETS INACTIFS ────────────────────────
 const warnedTickets = new Set();
 
 // ── STORE CANDIDATURES (en mémoire) ──────────────
 const candidatures = {};
-const AVIS_CHANNEL_ID      = '1488696917084082187'; // Salon où poster les avis clients
+const AVIS_CHANNEL_ID = '1488696917084082187'; // Salon où poster les avis clients
+
+// ── ROLE REACT CONFIG (mémoire + persisté Firestore) ──
+// Map<messageId, Array<{ emoji: string, roleId: string }>>
+const roleReactConfig = new Map();
+
+// ── TICKET TRANSCRIPTS (mémoire temporaire) ───────
+// Map<transcriptKey, { text: string, channelName: string }>
+const ticketTranscripts = new Map();
 
 // ── OPTIONS TICKETS ───────────────────────────────
 const TICKET_OPTIONS = [
@@ -74,7 +86,8 @@ const WELCOME_MESSAGES = [
 // ── JOURNAL LISTENER (temps réel) ─────────────────
 const knownJournalIds = new Set();
 
-// ── HELPER PATRON ─────────────────────────────────
+// ── HELPERS ───────────────────────────────────────
+
 function isPatron(interaction) {
   if (process.env.PATRON_ROLE_ID) {
     return interaction.member.roles.cache.has(process.env.PATRON_ROLE_ID);
@@ -82,16 +95,95 @@ function isPatron(interaction) {
   return interaction.member.roles.cache.some(r => r.name === 'Patron');
 }
 
+// Agent OU Patron → accès aux commandes Agent
+function isAgent(interaction) {
+  return interaction.member.roles.cache.has(AGENT_ROLE_ID) || isPatron(interaction);
+}
+
+// Normalise un emoji (unicode ou custom) en clé de stockage
+function normalizeEmoji(emojiStr) {
+  const match = emojiStr.match(/<a?:[\w]+:(\d+)>/);
+  if (match) return match[1]; // ID du custom emoji
+  return emojiStr.trim();     // Emoji unicode brut
+}
+
+// Récupère TOUS les messages d'un salon (pagination)
+async function fetchAllMessages(channel) {
+  const messages = [];
+  let lastId = null;
+  while (true) {
+    const options = { limit: 100 };
+    if (lastId) options.before = lastId;
+    const batch = await channel.messages.fetch(options);
+    if (!batch.size) break;
+    messages.push(...batch.values());
+    lastId = batch.last().id;
+    if (batch.size < 100) break;
+  }
+  return messages.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+}
+
+// Construit le texte du transcript
+function buildTranscript(channel, messages, closedByName) {
+  const sep = '═'.repeat(55);
+  const lines = [
+    sep,
+    `  TRANSCRIPT — #${channel.name}`,
+    `  Fermé par   : ${closedByName}`,
+    `  Date        : ${new Date().toLocaleString('fr-FR')}`,
+    `  Messages    : ${messages.length}`,
+    sep,
+    '',
+  ];
+  for (const msg of messages) {
+    const ts = new Date(msg.createdTimestamp).toLocaleString('fr-FR');
+    const author = msg.author?.tag || 'Inconnu';
+    if (msg.embeds.length && !msg.content) {
+      const e = msg.embeds[0];
+      const title = e.title || '';
+      const desc  = e.description ? e.description.replace(/\n/g, ' ') : '';
+      lines.push(`[${ts}] ${author} [EMBED]: ${title}${desc ? ' — ' + desc : ''}`);
+    } else {
+      const content = msg.content || (msg.embeds.length ? '[Embed]' : '[Aucun contenu]');
+      const pj = msg.attachments.size ? ` [${msg.attachments.size} PJ]` : '';
+      lines.push(`[${ts}] ${author}: ${content}${pj}`);
+    }
+  }
+  lines.push('', sep, `  Fin du transcript — Agence Immobilière`, sep);
+  return lines.join('\n');
+}
+
+// Sauvegarde roleReactConfig dans Firestore
+async function saveRoleReactConfig() {
+  const configs = {};
+  for (const [msgId, pairs] of roleReactConfig) {
+    configs[msgId] = pairs;
+  }
+  try {
+    await setDoc(ROLE_REACT_REF, { configs });
+  } catch (e) {
+    console.error('Erreur sauvegarde role-react:', e.message);
+  }
+}
+
+// Recherche un message dans tous les salons texte du serveur
+async function findMessageInGuild(guild, messageId) {
+  for (const channel of guild.channels.cache.values()) {
+    if (!channel.isTextBased()) continue;
+    try {
+      const msg = await channel.messages.fetch(messageId);
+      if (msg) return msg;
+    } catch { /* salon sans accès ou message inexistant */ }
+  }
+  return null;
+}
+
 // ── COMMANDES ─────────────────────────────────────
 const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Liste des commandes disponibles'),
-  new SlashCommandBuilder().setName('caisse').setDescription('Affiche la caisse commune'),
   new SlashCommandBuilder().setName('membres').setDescription('Liste les membres et leur statut'),
-  new SlashCommandBuilder().setName('missions').setDescription('Liste les missions actives'),
-  new SlashCommandBuilder().setName('journal').setDescription('5 dernières entrées du journal'),
-  new SlashCommandBuilder().setName('transaction').setDescription('Ajoute une transaction'),
-  new SlashCommandBuilder().setName('tablette').setDescription('Lien d\'accès à la tablette'),
-  new SlashCommandBuilder().setName('dossier').setDescription('Lien d\'accès au dossier RP'),
+  new SlashCommandBuilder().setName('tablette').setDescription('🔒 [Agent] Lien d\'accès à la tablette'),
+  new SlashCommandBuilder().setName('dossier').setDescription('🔒 [Agent] Lien d\'accès au dossier RP'),
   new SlashCommandBuilder().setName('creer-compte').setDescription('👑 [Patron] Crée un compte membre'),
   new SlashCommandBuilder()
     .setName('supprimer-compte')
@@ -123,6 +215,26 @@ const commands = [
     .addSubcommand(s => s.setName('remove').setDescription('Retirer un membre de la blacklist')
       .addUserOption(o => o.setName('membre').setDescription('Membre à retirer').setRequired(true)))
     .addSubcommand(s => s.setName('liste').setDescription('Afficher la blacklist')),
+  new SlashCommandBuilder()
+    .setName('role-react')
+    .setDescription('👑 [Patron] Configurer les rôles par réaction sur un message')
+    .addSubcommand(s => s
+      .setName('ajouter')
+      .setDescription('Associer une réaction emoji → rôle sur un message')
+      .addStringOption(o => o.setName('message_id').setDescription('ID du message Discord').setRequired(true))
+      .addStringOption(o => o.setName('emoji').setDescription('Emoji de réaction (ex: 👍 ou custom emoji)').setRequired(true))
+      .addRoleOption(o => o.setName('role').setDescription('Rôle à attribuer/retirer automatiquement').setRequired(true))
+    )
+    .addSubcommand(s => s
+      .setName('supprimer')
+      .setDescription('Retirer une config role-react (un emoji ou tout le message)')
+      .addStringOption(o => o.setName('message_id').setDescription('ID du message').setRequired(true))
+      .addStringOption(o => o.setName('emoji').setDescription('Emoji à retirer (laisser vide = tout supprimer pour ce message)').setRequired(false))
+    )
+    .addSubcommand(s => s
+      .setName('liste')
+      .setDescription('Afficher tous les role-react configurés')
+    ),
 ];
 
 // ── REGISTER ──────────────────────────────────────
@@ -133,22 +245,22 @@ const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
 })();
 
 // ── CLIENT ────────────────────────────────────────
-// NOTE : GuildMembers est un intent privilégié — il doit être activé
-// dans le Discord Developer Portal (Bot → Privileged Gateway Intents)
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.DirectMessages,
-  ]
+    GatewayIntentBits.GuildMessageReactions,
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-// ── READY : listener journal Firestore ───────────
+// ── READY : chargement données + listener journal ─
 client.once('ready', async () => {
   console.log(`✅ Bot connecté : ${client.user.tag}`);
   startAutoCloseInterval();
 
-  // Charger les IDs existants pour ne pas les reposter au démarrage
+  // Charger les IDs existants du journal pour ne pas les reposter au démarrage
   try {
     const snap = await getDoc(REF);
     const initData = snap.data();
@@ -160,7 +272,23 @@ client.once('ready', async () => {
     console.error('Erreur chargement journal initial :', err.message);
   }
 
-  // Écoute en temps réel : nouvelles entrées → salon de logs
+  // Charger les configs role-react depuis Firestore
+  try {
+    const snap = await getDoc(ROLE_REACT_REF);
+    if (snap.exists()) {
+      const data = snap.data();
+      if (data?.configs) {
+        for (const [msgId, pairs] of Object.entries(data.configs)) {
+          roleReactConfig.set(msgId, pairs);
+        }
+        console.log(`🎭 ${roleReactConfig.size} config(s) role-react chargée(s)`);
+      }
+    }
+  } catch (err) {
+    console.error('Erreur chargement role-react :', err.message);
+  }
+
+  // Écoute en temps réel : nouvelles entrées journal → salon de logs
   onSnapshot(REF, async (docSnap) => {
     const data = docSnap.data();
     if (!data?.journal) return;
@@ -174,7 +302,6 @@ client.once('ready', async () => {
     for (const entry of newEntries) {
       knownJournalIds.add(entry.id);
 
-      // Choisir le bon salon selon l'origine
       const isDiscordEntry = entry.auteur === 'Bot Discord';
       const channelId = isDiscordEntry ? LOGS_DISCORD_ID : LOGS_TABLETTE_ID;
 
@@ -185,10 +312,7 @@ client.once('ready', async () => {
         console.warn(`⚠️ Impossible de récupérer le salon de logs : ${channelId}`);
         continue;
       }
-      if (!logChannel) {
-        console.warn(`⚠️ Salon de logs introuvable : ${channelId}`);
-        continue;
-      }
+      if (!logChannel) continue;
 
       await logChannel.send({ embeds: [{
         title: `📓 ${entry.titre}`,
@@ -221,7 +345,69 @@ client.on('guildMemberAdd', async member => {
   }]});
 });
 
-// ── HELPER : FERMETURE DE TICKET ─────────────────
+// ════════════════════════════════════════════════
+// ROLE REACT — RÉACTION AJOUTÉE
+// ════════════════════════════════════════════════
+client.on('messageReactionAdd', async (reaction, user) => {
+  if (user.bot) return;
+  if (reaction.partial) {
+    try { await reaction.fetch(); } catch { return; }
+  }
+  if (user.partial) {
+    try { await user.fetch(); } catch { return; }
+  }
+
+  const configs = roleReactConfig.get(reaction.message.id);
+  if (!configs || !configs.length) return;
+
+  const emojiKey = reaction.emoji.id || reaction.emoji.name;
+  const pair = configs.find(p => p.emoji === emojiKey);
+  if (!pair) return;
+
+  const guild = reaction.message.guild;
+  if (!guild) return;
+
+  try {
+    const member = await guild.members.fetch(user.id);
+    await member.roles.add(pair.roleId);
+    console.log(`✅ Role-react: ${user.tag} → rôle ${pair.roleId} ajouté`);
+  } catch (e) {
+    console.error('Erreur role-react add :', e.message);
+  }
+});
+
+// ════════════════════════════════════════════════
+// ROLE REACT — RÉACTION RETIRÉE
+// ════════════════════════════════════════════════
+client.on('messageReactionRemove', async (reaction, user) => {
+  if (user.bot) return;
+  if (reaction.partial) {
+    try { await reaction.fetch(); } catch { return; }
+  }
+  if (user.partial) {
+    try { await user.fetch(); } catch { return; }
+  }
+
+  const configs = roleReactConfig.get(reaction.message.id);
+  if (!configs || !configs.length) return;
+
+  const emojiKey = reaction.emoji.id || reaction.emoji.name;
+  const pair = configs.find(p => p.emoji === emojiKey);
+  if (!pair) return;
+
+  const guild = reaction.message.guild;
+  if (!guild) return;
+
+  try {
+    const member = await guild.members.fetch(user.id);
+    await member.roles.remove(pair.roleId);
+    console.log(`✅ Role-react: ${user.tag} → rôle ${pair.roleId} retiré`);
+  } catch (e) {
+    console.error('Erreur role-react remove :', e.message);
+  }
+});
+
+// ── FERMETURE DE TICKET ───────────────────────────
 async function closeTicketChannel(channel, closedByName = 'Automatique') {
   try {
     // Récupérer l'ID de l'ouvreur depuis le topic
@@ -233,7 +419,7 @@ async function closeTicketChannel(channel, closedByName = 'Automatique') {
     const hours    = Math.floor(duration / 3600000);
     const minutes  = Math.floor((duration % 3600000) / 60000);
 
-    // Trouver l'agent ayant pris en charge (depuis le 1er embed du bot)
+    // Trouver l'agent ayant pris en charge
     let claimedBy = 'Non pris en charge';
     try {
       const msgs = await channel.messages.fetch({ limit: 50 });
@@ -244,25 +430,55 @@ async function closeTicketChannel(channel, closedByName = 'Automatique') {
       }
     } catch { /* ignore */ }
 
+    // ── GÉNÉRATION DU TRANSCRIPT (avant suppression du salon) ──
+    let transcriptText = null;
+    try {
+      const allMsgs = await fetchAllMessages(channel);
+      transcriptText = buildTranscript(channel, allMsgs, closedByName);
+    } catch (e) {
+      console.error('Erreur génération transcript :', e.message);
+    }
+
     // ── LOG CHANNEL ────────────────────────────
     try {
       const logCh = await client.channels.fetch(TICKET_LOG_CHANNEL_ID);
       if (logCh) {
-        await logCh.send({ embeds: [{
-          title: `🔒 Ticket fermé — ${channel.name}`,
-          color: 0xf44336,
-          fields: [
-            { name: '📁 Salon',             value: `\`${channel.name}\``,                    inline: true },
-            { name: '⏱ Durée',             value: `${hours}h ${minutes}min`,                inline: true },
-            { name: '🔒 Fermé par',         value: closedByName,                             inline: true },
-            { name: '👤 Ouvert par',        value: openerId ? `<@${openerId}>` : 'Inconnu', inline: true },
-            { name: '🙋 Pris en charge par',value: claimedBy,                               inline: true },
-          ],
-          timestamp: new Date().toISOString(),
-          footer: { text: 'Agence Immobilière · Logs tickets' },
-        }]});
+        // Clé unique pour retrouver le transcript via le bouton
+        const transcriptKey = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+        const logMsg = await logCh.send({
+          embeds: [{
+            title: `🔒 Ticket fermé — ${channel.name}`,
+            color: 0xf44336,
+            fields: [
+              { name: '📁 Salon',              value: `\`${channel.name}\``,                    inline: true },
+              { name: '⏱ Durée',              value: `${hours}h ${minutes}min`,                inline: true },
+              { name: '🔒 Fermé par',          value: closedByName,                             inline: true },
+              { name: '👤 Ouvert par',         value: openerId ? `<@${openerId}>` : 'Inconnu', inline: true },
+              { name: '🙋 Pris en charge par', value: claimedBy,                               inline: true },
+            ],
+            timestamp: new Date().toISOString(),
+            footer: { text: 'Agence Immobilière · Logs tickets' },
+          }],
+          components: transcriptText ? [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setCustomId(`ticket-transcript_${transcriptKey}`)
+                .setLabel('📄 Voir les messages')
+                .setStyle(ButtonStyle.Secondary)
+            )
+          ] : [],
+        });
+
+        // Stocker le transcript en mémoire
+        if (transcriptText && logMsg) {
+          ticketTranscripts.set(transcriptKey, {
+            text: transcriptText,
+            channelName: channel.name,
+          });
+        }
       }
-    } catch (e) { console.error('Erreur log ticket:', e.message); }
+    } catch (e) { console.error('Erreur log ticket :', e.message); }
 
     // ── DM À L'OUVREUR ────────────────────────
     if (openerId) {
@@ -288,7 +504,7 @@ async function closeTicketChannel(channel, closedByName = 'Automatique') {
     setTimeout(() => channel.delete().catch(() => {}), 4000);
 
   } catch (err) {
-    console.error('Erreur closeTicketChannel:', err.message);
+    console.error('Erreur closeTicketChannel :', err.message);
   }
 }
 
@@ -345,9 +561,8 @@ client.on('interactionCreate', async interaction => {
         .setCustomId('help-menu')
         .setPlaceholder('Choisir une catégorie...')
         .addOptions(
-          new StringSelectMenuOptionBuilder().setLabel('📊 Général').setValue('general').setDescription('Caisse, membres, missions, journal'),
-          new StringSelectMenuOptionBuilder().setLabel('💸 Finances').setValue('finances').setDescription('Transactions et caisse'),
-          new StringSelectMenuOptionBuilder().setLabel('🔗 Liens').setValue('liens').setDescription('Tablette et dossier RP'),
+          new StringSelectMenuOptionBuilder().setLabel('📊 Général').setValue('general').setDescription('Membres, avis'),
+          new StringSelectMenuOptionBuilder().setLabel('🔗 Liens').setValue('liens').setDescription('Tablette et dossier RP (Agents)'),
           new StringSelectMenuOptionBuilder().setLabel('👑 Patron').setValue('patron').setDescription('Commandes réservées aux Patrons'),
         );
 
@@ -363,23 +578,6 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // ── CAISSE ─────────────────────────────────────
-    if (interaction.commandName === 'caisse') {
-      const data = (await getDoc(REF)).data();
-      const caisse   = new Intl.NumberFormat('fr-FR').format(data.finances.caisse);
-      const objectif = new Intl.NumberFormat('fr-FR').format(data.finances.objectif);
-      const pct      = data.finances.objectif > 0 ? Math.round((data.finances.caisse / data.finances.objectif) * 100) : 0;
-      await interaction.reply({ embeds: [{
-        title: '💰 Caisse Commune', color: 0x5bb8d4,
-        fields: [
-          { name: 'Disponible',  value: `**${caisse} $**`, inline: true },
-          { name: 'Objectif',    value: `${objectif} $`,   inline: true },
-          { name: 'Progression', value: `${pct}%`,         inline: true },
-        ],
-        footer: { text: 'Tablette de gestion · Agence Immobilière' }
-      }]});
-    }
-
     // ── MEMBRES ────────────────────────────────────
     if (interaction.commandName === 'membres') {
       const data   = (await getDoc(REF)).data();
@@ -390,52 +588,30 @@ client.on('interactionCreate', async interaction => {
       await interaction.reply({ embeds: [{ title: '👥 Membres', color: 0x5bb8d4, description: lignes, footer: { text: 'Tablette de gestion · Agence Immobilière' } }]});
     }
 
-    // ── MISSIONS ───────────────────────────────────
-    if (interaction.commandName === 'missions') {
-      const data    = (await getDoc(REF)).data();
-      const actives = data.missions.filter(m => !m.done);
-      if (!actives.length) { await interaction.reply('Aucune mission active.'); return; }
-      const lignes  = actives.map(m => `▸ **${m.titre}** — ${m.phase}`).join('\n');
-      await interaction.reply({ embeds: [{ title: '🎯 Missions actives', color: 0x5bb8d4, description: lignes, footer: { text: 'Tablette de gestion · Agence Immobilière' } }]});
-    }
-
-    // ── JOURNAL ────────────────────────────────────
-    if (interaction.commandName === 'journal') {
-      const data   = (await getDoc(REF)).data();
-      const recent = [...data.journal].sort((a,b) => b.ts - a.ts).slice(0,5);
-      if (!recent.length) { await interaction.reply('Aucune entrée.'); return; }
-      const lignes = recent.map(e => `▸ **${e.titre}**\n${e.contenu}`).join('\n\n');
-      await interaction.reply({ embeds: [{ title: '📓 Journal — 5 dernières entrées', color: 0x5bb8d4, description: lignes, footer: { text: 'Tablette de gestion · Agence Immobilière' } }]});
-    }
-
-    // ── TABLETTE ───────────────────────────────────
+    // ── TABLETTE — AGENT ONLY ──────────────────────
     if (interaction.commandName === 'tablette') {
+      if (!isAgent(interaction)) {
+        await interaction.reply({ content: '❌ Cette commande est réservée aux **Agents** et **Patrons**.', ephemeral: true });
+        return;
+      }
       await interaction.reply({ embeds: [{
         title: '📱 Tablette de gestion', color: 0x5bb8d4,
         description: '[**Accéder à la tablette →**](https://comfy-snickerdoodle-dd1ffa.netlify.app/gate.html)',
         footer: { text: 'Tablette de gestion · Agence Immobilière' }
-      }]});
+      }], ephemeral: true });
     }
 
-    // ── DOSSIER ────────────────────────────────────
+    // ── DOSSIER — AGENT ONLY ───────────────────────
     if (interaction.commandName === 'dossier') {
+      if (!isAgent(interaction)) {
+        await interaction.reply({ content: '❌ Cette commande est réservée aux **Agents** et **Patrons**.', ephemeral: true });
+        return;
+      }
       await interaction.reply({ embeds: [{
         title: '📂 Dossier RP', color: 0x5bb8d4,
         description: '[**Accéder au dossier →**](https://polite-seahorse-5e93cb.netlify.app)',
         footer: { text: 'Tablette de gestion · Agence Immobilière' }
-      }]});
-    }
-
-    // ── TRANSACTION (modal) ────────────────────────
-    if (interaction.commandName === 'transaction') {
-      const modal = new ModalBuilder().setCustomId('modal-transaction').setTitle('💸 Nouvelle transaction');
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('libelle').setLabel('Libellé').setPlaceholder('Ex : Vente appartement Vinewood').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('montant').setLabel('Montant ($)').setPlaceholder('50000').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('type').setLabel('Type : entree ou sortie').setPlaceholder('entree').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('note').setLabel('Note (optionnel)').setPlaceholder('Précisions...').setStyle(TextInputStyle.Short).setRequired(false)),
-      );
-      await interaction.showModal(modal);
+      }], ephemeral: true });
     }
 
     // ── CREER COMPTE (modal) — PATRON ONLY ────────
@@ -587,85 +763,67 @@ client.on('interactionCreate', async interaction => {
       if (!isPatron(interaction)) { await interaction.reply({ content: '❌ Réservé aux Patrons.', ephemeral: true }); return; }
       const sub = interaction.options.getSubcommand();
 
-      // ── ADD ──
       if (sub === 'add') {
         const cible  = interaction.options.getUser('membre');
         const raison = interaction.options.getString('raison');
         const member = await interaction.guild.members.fetch(cible.id).catch(() => null);
-
         const snap = await getDoc(REF);
         const data = snap.data();
         data.blacklist = data.blacklist || [];
-
         if (data.blacklist.find(b => b.userId === cible.id)) {
           await interaction.reply({ content: `⚠️ **${cible.displayName}** est déjà blacklisté.`, ephemeral: true });
           return;
         }
-
         data.blacklist.push({ userId: cible.id, pseudo: cible.username, raison, date: Date.now(), addedBy: interaction.user.username });
         await setDoc(REF, data);
-
         if (member) await member.roles.add(BLACKLIST_ROLE_ID).catch(() => {});
-
         await interaction.reply({ embeds: [{
-          title: '🚫 Membre blacklisté',
-          color: 0xf44336,
+          title: '🚫 Membre blacklisté', color: 0xf44336,
           fields: [
-            { name: '👤 Membre',  value: `<@${cible.id}>`,                   inline: true },
-            { name: '📋 Raison', value: raison,                              inline: true },
-            { name: '👑 Par',    value: interaction.user.displayName,        inline: true },
+            { name: '👤 Membre',  value: `<@${cible.id}>`,            inline: true },
+            { name: '📋 Raison', value: raison,                       inline: true },
+            { name: '👑 Par',    value: interaction.user.displayName, inline: true },
           ],
           timestamp: new Date().toISOString(),
           footer: { text: 'Agence Immobilière · Blacklist' },
         }]});
       }
 
-      // ── REMOVE ──
       if (sub === 'remove') {
         const cible  = interaction.options.getUser('membre');
         const member = await interaction.guild.members.fetch(cible.id).catch(() => null);
-
         const snap = await getDoc(REF);
         const data = snap.data();
         data.blacklist = data.blacklist || [];
         const before = data.blacklist.length;
         data.blacklist = data.blacklist.filter(b => b.userId !== cible.id);
-
         if (data.blacklist.length === before) {
           await interaction.reply({ content: `⚠️ **${cible.username}** n'est pas dans la blacklist.`, ephemeral: true });
           return;
         }
-
         await setDoc(REF, data);
         if (member) await member.roles.remove(BLACKLIST_ROLE_ID).catch(() => {});
-
         await interaction.reply({ embeds: [{
-          title: '✅ Membre retiré de la blacklist',
-          color: 0x4caf50,
+          title: '✅ Membre retiré de la blacklist', color: 0x4caf50,
           description: `<@${cible.id}> a été retiré de la blacklist.`,
           footer: { text: 'Agence Immobilière · Blacklist' },
         }]});
       }
 
-      // ── LISTE ──
       if (sub === 'liste') {
         const snap = await getDoc(REF);
         const data = snap.data();
         const bl   = data.blacklist || [];
-
         if (!bl.length) {
           await interaction.reply({ embeds: [{ title: '🚫 Blacklist', color: 0x5bb8d4, description: 'Aucun membre blacklisté.', footer: { text: 'Agence Immobilière · Blacklist' } }], ephemeral: true });
           return;
         }
-
         const lignes = bl.map((b, i) => {
           const dateStr = new Date(b.date).toLocaleDateString('fr-FR');
           return `**${i+1}.** <@${b.userId}> — ${b.raison}\n> Ajouté par ${b.addedBy} le ${dateStr}`;
         }).join('\n\n');
-
         await interaction.reply({ embeds: [{
-          title: `🚫 Blacklist — ${bl.length} membre(s)`,
-          color: 0xf44336,
+          title: `🚫 Blacklist — ${bl.length} membre(s)`, color: 0xf44336,
           description: lignes,
           footer: { text: 'Agence Immobilière · Blacklist' },
         }], ephemeral: true });
@@ -677,31 +835,13 @@ client.on('interactionCreate', async interaction => {
       const modal = new ModalBuilder().setCustomId('modal-avis').setTitle('⭐ Laisser un avis');
       modal.addComponents(
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId('note')
-            .setLabel('Note globale (1 à 5 étoiles)')
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setPlaceholder('Ex : 5')
-            .setMinLength(1)
-            .setMaxLength(1)
+          new TextInputBuilder().setCustomId('note').setLabel('Note globale (1 à 5 étoiles)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 5').setMinLength(1).setMaxLength(1)
         ),
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId('avis')
-            .setLabel('Votre avis')
-            .setStyle(TextInputStyle.Paragraph)
-            .setRequired(true)
-            .setPlaceholder('Décrivez votre expérience avec l\'Agence Immobilière...')
-            .setMaxLength(1000)
+          new TextInputBuilder().setCustomId('avis').setLabel('Votre avis').setStyle(TextInputStyle.Paragraph).setRequired(true).setPlaceholder('Décrivez votre expérience avec l\'Agence Immobilière...').setMaxLength(1000)
         ),
         new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId('agent')
-            .setLabel('Nom de l\'agent (optionnel)')
-            .setStyle(TextInputStyle.Short)
-            .setRequired(false)
-            .setPlaceholder('Ex : Jonathan Wise')
+          new TextInputBuilder().setCustomId('agent').setLabel('Nom de l\'agent (optionnel)').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('Ex : Jonathan Wise')
         ),
       );
       await interaction.showModal(modal);
@@ -754,6 +894,122 @@ client.on('interactionCreate', async interaction => {
       );
       await interaction.showModal(modal);
     }
+
+    // ════════════════════════════════════════════════
+    // ROLE REACT — PATRON ONLY
+    // ════════════════════════════════════════════════
+    if (interaction.commandName === 'role-react') {
+      if (!isPatron(interaction)) { await interaction.reply({ content: '❌ Réservé aux Patrons.', ephemeral: true }); return; }
+      const sub = interaction.options.getSubcommand();
+
+      // ── AJOUTER ────────────────────────────────────
+      if (sub === 'ajouter') {
+        const messageId = interaction.options.getString('message_id').trim();
+        const emojiRaw  = interaction.options.getString('emoji').trim();
+        const role      = interaction.options.getRole('role');
+
+        const emojiKey = normalizeEmoji(emojiRaw);
+
+        // Chercher le message dans le serveur et y ajouter la réaction du bot
+        await interaction.deferReply({ ephemeral: true });
+
+        const targetMsg = await findMessageInGuild(interaction.guild, messageId);
+        if (!targetMsg) {
+          await interaction.editReply({ content: `❌ Message introuvable. Vérifie l'ID \`${messageId}\` et assure-toi que j'ai accès au salon.` });
+          return;
+        }
+
+        // Ajouter ou mettre à jour la config
+        const existing = roleReactConfig.get(messageId) || [];
+        const alreadyExists = existing.find(p => p.emoji === emojiKey && p.roleId === role.id);
+        if (alreadyExists) {
+          await interaction.editReply({ content: `⚠️ Cette combinaison emoji + rôle est déjà configurée sur ce message.` });
+          return;
+        }
+
+        existing.push({ emoji: emojiKey, roleId: role.id });
+        roleReactConfig.set(messageId, existing);
+        await saveRoleReactConfig();
+
+        // Réagir au message avec l'emoji (pour que les users puissent cliquer)
+        try {
+          await targetMsg.react(emojiRaw);
+        } catch (e) {
+          console.warn('Impossible de réagir au message :', e.message);
+        }
+
+        await interaction.editReply({ embeds: [{
+          title: '✅ Role-react configuré',
+          color: 0x4caf50,
+          fields: [
+            { name: '📝 Message',  value: `[Voir le message](${targetMsg.url})`,      inline: true },
+            { name: '😀 Emoji',    value: emojiRaw,                                   inline: true },
+            { name: '🎭 Rôle',    value: `<@&${role.id}>`,                            inline: true },
+          ],
+          description: 'Les membres qui réagissent avec cet emoji recevront automatiquement le rôle. Retirer la réaction le supprime.',
+          footer: { text: 'Agence Immobilière · Role React' },
+          timestamp: new Date().toISOString(),
+        }]});
+      }
+
+      // ── SUPPRIMER ─────────────────────────────────
+      if (sub === 'supprimer') {
+        const messageId = interaction.options.getString('message_id').trim();
+        const emojiRaw  = interaction.options.getString('emoji')?.trim();
+
+        if (!roleReactConfig.has(messageId)) {
+          await interaction.reply({ content: `❌ Aucun role-react configuré pour le message \`${messageId}\`.`, ephemeral: true });
+          return;
+        }
+
+        if (emojiRaw) {
+          // Supprimer uniquement la paire avec cet emoji
+          const emojiKey = normalizeEmoji(emojiRaw);
+          const pairs = roleReactConfig.get(messageId).filter(p => p.emoji !== emojiKey);
+          if (pairs.length === 0) {
+            roleReactConfig.delete(messageId);
+          } else {
+            roleReactConfig.set(messageId, pairs);
+          }
+          await saveRoleReactConfig();
+          await interaction.reply({ content: `✅ La réaction **${emojiRaw}** a été retirée de la config du message \`${messageId}\`.`, ephemeral: true });
+        } else {
+          // Supprimer tout le message
+          roleReactConfig.delete(messageId);
+          await saveRoleReactConfig();
+          await interaction.reply({ content: `✅ Toutes les configs role-react du message \`${messageId}\` ont été supprimées.`, ephemeral: true });
+        }
+      }
+
+      // ── LISTE ──────────────────────────────────────
+      if (sub === 'liste') {
+        if (!roleReactConfig.size) {
+          await interaction.reply({ embeds: [{
+            title: '🎭 Role React — Aucune config',
+            color: 0x5bb8d4,
+            description: 'Aucun role-react configuré pour le moment.\nUtilise `/role-react ajouter` pour en créer un.',
+            footer: { text: 'Agence Immobilière · Role React' },
+          }], ephemeral: true });
+          return;
+        }
+
+        const lines = [];
+        for (const [msgId, pairs] of roleReactConfig) {
+          lines.push(`**Message ID :** \`${msgId}\``);
+          for (const p of pairs) {
+            lines.push(`  └ ${p.emoji} → <@&${p.roleId}>`);
+          }
+        }
+
+        await interaction.reply({ embeds: [{
+          title: `🎭 Role React — ${roleReactConfig.size} message(s) configuré(s)`,
+          color: 0x5bb8d4,
+          description: lines.join('\n'),
+          footer: { text: 'Agence Immobilière · Role React' },
+          timestamp: new Date().toISOString(),
+        }], ephemeral: true });
+      }
+    }
   }
 
   // ════════════════════════════════════════════════
@@ -765,24 +1021,15 @@ client.on('interactionCreate', async interaction => {
       general: {
         title: '📊 Commandes générales', color: 0x5bb8d4,
         fields: [
-          { name: '💰 /caisse',  value: 'Caisse commune, objectif et progression.', inline: false },
           { name: '👥 /membres', value: 'Liste des membres et leur statut.', inline: false },
-          { name: '🎯 /missions',value: 'Missions actives par phase.', inline: false },
-          { name: '📓 /journal', value: '5 dernières entrées du journal.', inline: false },
           { name: '⭐ /avis',    value: 'Laisser un avis sur l\'Agence Immobilière.', inline: false },
         ]
       },
-      finances: {
-        title: '💸 Commandes finances', color: 0x4caf50,
-        fields: [
-          { name: '💸 /transaction', value: 'Ouvre un formulaire pour ajouter une transaction à la caisse.', inline: false },
-        ]
-      },
       liens: {
-        title: '🔗 Liens', color: 0x5bb8d4,
+        title: '🔒 Liens — Accès Agent', color: 0x5bb8d4,
         fields: [
-          { name: '📱 /tablette', value: 'Lien d\'accès à la tablette de gestion.', inline: false },
-          { name: '📂 /dossier',  value: 'Lien d\'accès au dossier RP.', inline: false },
+          { name: '📱 /tablette', value: 'Lien d\'accès à la tablette de gestion. *(Agents & Patrons)*', inline: false },
+          { name: '📂 /dossier',  value: 'Lien d\'accès au dossier RP. *(Agents & Patrons)*', inline: false },
         ]
       },
       patron: {
@@ -797,6 +1044,8 @@ client.on('interactionCreate', async interaction => {
           { name: '📢 /annonce',          value: 'Crée une annonce dans le salon dédié (via formulaire).', inline: false },
           { name: '🌟 /news',             value: 'Publie une nouveauté avec image (via formulaire).', inline: false },
           { name: '🎫 /ticket-setup',     value: 'Poste le panneau de création de tickets dans le salon actuel.', inline: false },
+          { name: '🎭 /role-react',       value: 'Configurer des rôles attribués automatiquement via les réactions.\n`ajouter` · `supprimer` · `liste`', inline: false },
+          { name: '🚫 /blacklist',        value: 'Gérer la blacklist du serveur. `add` · `remove` · `liste`', inline: false },
         ]
       },
     };
@@ -807,7 +1056,7 @@ client.on('interactionCreate', async interaction => {
   }
 
   // ════════════════════════════════════════════════
-  // SELECT MENU — PERMIS RECRUTEMENT
+  // SELECT MENU — RECRUTEMENT (permis)
   // ════════════════════════════════════════════════
   if (interaction.isStringSelectMenu() && interaction.customId === 'recruit-permis') {
     const d = candidatures[interaction.user.id];
@@ -863,69 +1112,43 @@ client.on('interactionCreate', async interaction => {
     const val    = interaction.values[0];
     const option = TICKET_OPTIONS.find(o => o.value === val);
 
-    // ── CAS ANNULATION ────────────────────────────
     if (val === 'annuler') {
       await interaction.reply({ content: 'Pas de souci, tu peux revenir quand tu veux ! 👋', ephemeral: true });
       return;
     }
 
-    // ── CAS RDV : modal direct ─────────────────────
     if (val === 'rdv') {
       const modal = new ModalBuilder().setCustomId('modal-rdv').setTitle('📅 Prise de rendez-vous');
       modal.addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('ig').setLabel('🎮 Numéro IG (obligatoire)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 1234')
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('identite').setLabel('💗 Prénom & Nom RP').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Jonathan Wise')
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('date').setLabel('📆 Date souhaitée').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Samedi 05/04')
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('heure').setLabel('🕐 Heure souhaitée').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 19h00 – 21h00')
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('infos').setLabel('📝 Informations complémentaires').setStyle(TextInputStyle.Paragraph).setRequired(false).setPlaceholder('Type de bien, budget, questions...')
-        ),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ig').setLabel('🎮 Numéro IG (obligatoire)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 1234')),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('identite').setLabel('💗 Prénom & Nom RP').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Jonathan Wise')),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel('📆 Date souhaitée').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : Samedi 05/04')),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('heure').setLabel('🕐 Heure souhaitée').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('Ex : 19h00 – 21h00')),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('infos').setLabel('📝 Informations complémentaires').setStyle(TextInputStyle.Paragraph).setRequired(false).setPlaceholder('Type de bien, budget, questions...')),
       );
       await interaction.showModal(modal);
       return;
     }
 
-    // ── CAS RECRUTEMENT : formulaire multi-étapes ──
     if (val === 'recrutement') {
-      const modal = new ModalBuilder()
-        .setCustomId('recruit-step1')
-        .setTitle('📩 Candidature — Étape 1/3');
+      const modal = new ModalBuilder().setCustomId('recruit-step1').setTitle('📩 Candidature — Étape 1/3');
       modal.addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('pseudo').setLabel('👤 Pseudo Discord').setStyle(TextInputStyle.Short).setValue(interaction.user.username).setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('id').setLabel('🆔 ID Unique (GTA)').setStyle(TextInputStyle.Short).setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('age').setLabel('🎂 Âge HRP').setStyle(TextInputStyle.Short).setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('dispo').setLabel('📅 Disponibilités (jours/horaires)').setStyle(TextInputStyle.Paragraph).setRequired(true)
-        ),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('pseudo').setLabel('👤 Pseudo Discord').setStyle(TextInputStyle.Short).setValue(interaction.user.username).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('id').setLabel('🆔 ID Unique (GTA)').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('age').setLabel('🎂 Âge HRP').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('dispo').setLabel('📅 Disponibilités (jours/horaires)').setStyle(TextInputStyle.Paragraph).setRequired(true)),
       );
       await interaction.showModal(modal);
       return;
     }
 
-    // Nom du salon : emoji・pseudo (compatible Discord : pas d'espaces, min 1 car)
     const safeName    = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').slice(0, 24);
     const channelName = `${option.emoji}・${safeName}`;
 
-    // Vérifier qu'un ticket n'est pas déjà ouvert pour cet utilisateur dans la catégorie
     const category = interaction.guild.channels.cache.get(TICKET_CATEGORY_ID);
     if (category) {
       const existing = interaction.guild.channels.cache.find(
-        c => c.parentId === TICKET_CATEGORY_ID &&
-             c.permissionOverwrites.cache.has(interaction.user.id)
+        c => c.parentId === TICKET_CATEGORY_ID && c.permissionOverwrites.cache.has(interaction.user.id)
       );
       if (existing) {
         await interaction.reply({
@@ -936,40 +1159,14 @@ client.on('interactionCreate', async interaction => {
       }
     }
 
-    // Créer le salon privé dans la catégorie tickets
     try {
       const permOverwrites = [
-        {
-          id: interaction.guild.id, // @everyone
-          deny: [PermissionFlagsBits.ViewChannel],
-        },
-        {
-          id: interaction.user.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.AttachFiles,
-          ],
-        },
-        {
-          id: client.user.id,
-          allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels],
-        },
+        { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles] },
+        { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] },
       ];
-
-      // Donner accès au rôle Patron si défini
       if (process.env.PATRON_ROLE_ID) {
-        permOverwrites.push({
-          id: process.env.PATRON_ROLE_ID,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.ManageMessages,
-            PermissionFlagsBits.AttachFiles,
-          ],
-        });
+        permOverwrites.push({ id: process.env.PATRON_ROLE_ID, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages, PermissionFlagsBits.AttachFiles] });
       }
 
       const ticketChannel = await interaction.guild.channels.create({
@@ -980,21 +1177,11 @@ client.on('interactionCreate', async interaction => {
         permissionOverwrites: permOverwrites,
       });
 
-      // Boutons du ticket
       const ticketButtons = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId('ticket-claim')
-          .setLabel('Prendre en charge')
-          .setEmoji('🙋')
-          .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-          .setCustomId('ticket-close')
-          .setLabel('Fermer le ticket')
-          .setEmoji('🔒')
-          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('ticket-claim').setLabel('Prendre en charge').setEmoji('🙋').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('ticket-close').setLabel('Fermer le ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger),
       );
 
-      // Message d'accueil dans le ticket
       await ticketChannel.send({
         content: `<@${interaction.user.id}>`,
         embeds: [{
@@ -1005,19 +1192,14 @@ client.on('interactionCreate', async interaction => {
             `Votre demande a bien été reçue par l'**Agence Immobilière**.\n\n` +
             `> **Objet :** ${option.description}\n\n` +
             `Un agent de notre équipe prendra en charge votre requête dans les meilleurs délais. En attendant, merci de **détailler votre demande** ci-dessous afin que nous puissions vous apporter la meilleure réponse possible.`,
-          fields: [
-            { name: '📋 Statut', value: '⏳ En attente de prise en charge', inline: true },
-          ],
+          fields: [{ name: '📋 Statut', value: '⏳ En attente de prise en charge', inline: true }],
           footer: { text: 'Agence Immobilière · Système de tickets' },
           timestamp: new Date().toISOString(),
         }],
         components: [ticketButtons],
       });
 
-      await interaction.reply({
-        content: `✅ Ton ticket a été créé : <#${ticketChannel.id}>`,
-        ephemeral: true,
-      });
+      await interaction.reply({ content: `✅ Ton ticket a été créé : <#${ticketChannel.id}>`, ephemeral: true });
 
     } catch (err) {
       console.error('Erreur création ticket :', err.message);
@@ -1026,29 +1208,41 @@ client.on('interactionCreate', async interaction => {
   }
 
   // ════════════════════════════════════════════════
-  // BOUTONS — TICKETS
+  // BOUTONS
   // ════════════════════════════════════════════════
   if (interaction.isButton()) {
+
+    // ── TRANSCRIPT — VOIR LES MESSAGES D'UN TICKET ─
+    if (interaction.customId.startsWith('ticket-transcript_')) {
+      const key = interaction.customId.replace('ticket-transcript_', '');
+      const data = ticketTranscripts.get(key);
+
+      if (!data) {
+        await interaction.reply({
+          content: '⚠️ Le transcript n\'est plus disponible (le bot a redémarré depuis la fermeture du ticket).',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const buffer = Buffer.from(data.text, 'utf-8');
+      await interaction.reply({
+        content: `📄 Transcript du ticket **${data.channelName}**`,
+        files: [{ attachment: buffer, name: `transcript-${data.channelName}.txt` }],
+        ephemeral: true,
+      });
+      return;
+    }
 
     // ── RECRUTEMENT : ÉTAPE 2 (bouton → modal) ────
     if (interaction.customId === 'recruit-step2-btn') {
       const modal = new ModalBuilder().setCustomId('recruit-step2').setTitle('📩 Candidature — Étape 2/3');
       modal.addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('identite').setLabel('💗 Prénom & Nom RP').setStyle(TextInputStyle.Short).setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('naissance').setLabel('🎂 Date de naissance RP').setStyle(TextInputStyle.Short).setPlaceholder('JJ/MM/AAAA').setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('tel').setLabel('📱 Téléphone RP').setStyle(TextInputStyle.Short).setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('nationalite').setLabel('🌍 Nationalité RP').setStyle(TextInputStyle.Short).setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('metier').setLabel('💼 Profession actuelle RP').setStyle(TextInputStyle.Short).setRequired(true)
-        ),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('identite').setLabel('💗 Prénom & Nom RP').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('naissance').setLabel('🎂 Date de naissance RP').setStyle(TextInputStyle.Short).setPlaceholder('JJ/MM/AAAA').setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('tel').setLabel('📱 Téléphone RP').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('nationalite').setLabel('🌍 Nationalité RP').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('metier').setLabel('💼 Profession actuelle RP').setStyle(TextInputStyle.Short).setRequired(true)),
       );
       await interaction.showModal(modal);
     }
@@ -1057,12 +1251,8 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId === 'recruit-step3-btn') {
       const modal = new ModalBuilder().setCustomId('recruit-step3').setTitle('📩 Candidature — Étape 3/3');
       modal.addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('motivation').setLabel('✍️ Pourquoi rejoindre l\'Agence ?').setStyle(TextInputStyle.Paragraph).setRequired(true)
-        ),
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('pourquoi').setLabel('⭐ Qu\'est-ce qui vous distingue ?').setStyle(TextInputStyle.Paragraph).setRequired(true)
-        ),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('motivation').setLabel('✍️ Pourquoi rejoindre l\'Agence ?').setStyle(TextInputStyle.Paragraph).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('pourquoi').setLabel('⭐ Qu\'est-ce qui vous distingue ?').setStyle(TextInputStyle.Paragraph).setRequired(true)),
       );
       await interaction.showModal(modal);
     }
@@ -1075,7 +1265,6 @@ client.on('interactionCreate', async interaction => {
       const userId = interaction.customId.split('_')[1];
       const data   = candidatures[userId];
 
-      // Créer le salon ticket dans la catégorie
       const safeName = (data?.identite || 'candidat').toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').slice(0, 24);
       const permOverwrites = [
         { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
@@ -1116,13 +1305,11 @@ client.on('interactionCreate', async interaction => {
           components: [closeBtn],
         });
 
-        // Mettre à jour le message staff (désactiver les boutons)
         const disabledRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('recruit-accept_x').setLabel('Accepté ✅').setStyle(ButtonStyle.Success).setDisabled(true),
           new ButtonBuilder().setCustomId('recruit-refuse_x').setLabel('Refuser').setStyle(ButtonStyle.Danger).setDisabled(true),
         );
         await interaction.message.edit({ components: [disabledRow] });
-
         await interaction.editReply({ content: `✅ Candidature acceptée. Ticket créé : <#${ticketChannel.id}>` });
         delete candidatures[userId];
 
@@ -1149,7 +1336,6 @@ client.on('interactionCreate', async interaction => {
         }]});
       } catch { /* DMs fermés */ }
 
-      // Désactiver les boutons
       const disabledRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('recruit-accept_x').setLabel('Accepter').setStyle(ButtonStyle.Success).setDisabled(true),
         new ButtonBuilder().setCustomId('recruit-refuse_x').setLabel('Refusé ❌').setStyle(ButtonStyle.Danger).setDisabled(true),
@@ -1167,34 +1353,18 @@ client.on('interactionCreate', async interaction => {
       }
 
       const originalEmbed = interaction.message.embeds[0];
-
-      // Remplacer le champ Statut par le nom du staff
       const fields = originalEmbed.fields
         .filter(f => f.name !== '📋 Statut')
         .concat([
-          { name: '📋 Statut',          value: '✅ Pris en charge',              inline: true },
-          { name: '🙋 Agent assigné',   value: `**${interaction.user.displayName}**`, inline: true },
+          { name: '📋 Statut',        value: '✅ Pris en charge',                   inline: true },
+          { name: '🙋 Agent assigné', value: `**${interaction.user.displayName}**`, inline: true },
         ]);
 
-      const updatedEmbed = {
-        ...originalEmbed.data,
-        color: 0x4caf50,
-        fields,
-      };
+      const updatedEmbed = { ...originalEmbed.data, color: 0x4caf50, fields };
 
-      // Désactiver le bouton "Prendre en charge", garder "Fermer"
       const updatedButtons = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId('ticket-claim')
-          .setLabel('Pris en charge')
-          .setEmoji('✅')
-          .setStyle(ButtonStyle.Success)
-          .setDisabled(true),
-        new ButtonBuilder()
-          .setCustomId('ticket-close')
-          .setLabel('Fermer le ticket')
-          .setEmoji('🔒')
-          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('ticket-claim').setLabel('Pris en charge').setEmoji('✅').setStyle(ButtonStyle.Success).setDisabled(true),
+        new ButtonBuilder().setCustomId('ticket-close').setLabel('Fermer le ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger),
       );
 
       await interaction.message.edit({ embeds: [updatedEmbed], components: [updatedButtons] });
@@ -1203,7 +1373,6 @@ client.on('interactionCreate', async interaction => {
 
     // ── FERMER LE TICKET ──────────────────────────
     if (interaction.customId === 'ticket-close') {
-      // Désactiver tous les boutons immédiatement
       const disabledButtons = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('ticket-claim').setLabel('Pris en charge').setEmoji('✅').setStyle(ButtonStyle.Success).setDisabled(true),
         new ButtonBuilder().setCustomId('ticket-close').setLabel('Fermer le ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger).setDisabled(true),
@@ -1234,7 +1403,6 @@ client.on('interactionCreate', async interaction => {
 
       await interaction.deferReply({ ephemeral: true });
 
-      // Créer le salon ticket pour ce RDV
       const safeName = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').slice(0, 24);
       const permOverwrites = [
         { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
@@ -1317,11 +1485,11 @@ client.on('interactionCreate', async interaction => {
     // ── MODAL RECRUIT ÉTAPE 2 ─────────────────────
     if (interaction.customId === 'recruit-step2') {
       const d = candidatures[interaction.user.id] || {};
-      d.identite   = interaction.fields.getTextInputValue('identite');
-      d.naissance  = interaction.fields.getTextInputValue('naissance');
-      d.tel        = interaction.fields.getTextInputValue('tel');
-      d.nationalite= interaction.fields.getTextInputValue('nationalite');
-      d.metier     = interaction.fields.getTextInputValue('metier');
+      d.identite    = interaction.fields.getTextInputValue('identite');
+      d.naissance   = interaction.fields.getTextInputValue('naissance');
+      d.tel         = interaction.fields.getTextInputValue('tel');
+      d.nationalite = interaction.fields.getTextInputValue('nationalite');
+      d.metier      = interaction.fields.getTextInputValue('metier');
       candidatures[interaction.user.id] = d;
       await interaction.reply({
         embeds: [{
@@ -1350,7 +1518,6 @@ client.on('interactionCreate', async interaction => {
       d.pourquoi   = interaction.fields.getTextInputValue('pourquoi');
       candidatures[interaction.user.id] = d;
 
-      // Menu select permis de conduire
       const permisMenu = new StringSelectMenuBuilder()
         .setCustomId('recruit-permis')
         .setPlaceholder('Avez-vous le permis de conduire RP ?')
@@ -1390,8 +1557,8 @@ client.on('interactionCreate', async interaction => {
         color: couleur,
         description: `*"${avis}"*`,
         fields: [
-          { name: '⭐ Note',    value: `**${note}/5**`, inline: true },
-          { name: '👤 Client',  value: `<@${interaction.user.id}>`, inline: true },
+          { name: '⭐ Note',    value: `**${note}/5**`,               inline: true },
+          { name: '👤 Client',  value: `<@${interaction.user.id}>`,  inline: true },
           ...(agent ? [{ name: '🤝 Agent', value: agent, inline: true }] : []),
         ],
         thumbnail: { url: interaction.user.displayAvatarURL({ dynamic: true }) },
@@ -1400,36 +1567,6 @@ client.on('interactionCreate', async interaction => {
       }]});
 
       await interaction.reply({ content: '✅ Merci pour ton avis ! Il a bien été publié.', ephemeral: true });
-    }
-
-    // ── MODAL TRANSACTION ──────────────────────────
-    if (interaction.customId === 'modal-transaction') {
-      const label   = interaction.fields.getTextInputValue('libelle').trim();
-      const montant = parseInt(interaction.fields.getTextInputValue('montant'));
-      const type    = interaction.fields.getTextInputValue('type').toLowerCase().trim();
-      const note    = interaction.fields.getTextInputValue('note').trim();
-
-      if (isNaN(montant) || montant <= 0) { await interaction.reply({ content: '❌ Montant invalide.', ephemeral: true }); return; }
-      if (type !== 'entree' && type !== 'sortie') { await interaction.reply({ content: '❌ Type invalide — écris `entree` ou `sortie`.', ephemeral: true }); return; }
-
-      const snap = await getDoc(REF);
-      const data = snap.data();
-      data.finances.caisse += type === 'entree' ? montant : -montant;
-      data.finances.transactions.push({ id: Date.now().toString(36), label, montant, type, ts: Date.now(), note: note || 'Via Discord' });
-      data.journal.push({ id: Date.now().toString(36)+'j', ts: Date.now(), titre: `Transaction : ${label}`, contenu: `${type==='entree'?'Entrée':'Sortie'} de ${new Intl.NumberFormat('fr-FR').format(montant)} $${note?' — '+note:''}`, tags: ['finances'], auteur: 'Bot Discord' });
-      await setDoc(REF, data);
-
-      const signe = type === 'entree' ? '+' : '−';
-      await interaction.reply({ embeds: [{
-        title: `${type==='entree'?'📈':'📉'} Transaction enregistrée`,
-        color: type === 'entree' ? 0x4caf50 : 0xf44336,
-        fields: [
-          { name: 'Libellé', value: label, inline: true },
-          { name: 'Montant', value: `${signe}${new Intl.NumberFormat('fr-FR').format(montant)} $`, inline: true },
-          ...(note ? [{ name: 'Note', value: note, inline: true }] : []),
-        ],
-        footer: { text: 'Enregistré dans la tablette en temps réel' }
-      }]});
     }
 
     // ── MODAL CREER COMPTE ─────────────────────────
