@@ -34,7 +34,7 @@ const LOGS_TABLETTE_ID    = '1488697548225908956'; // Journal depuis la tablette
 const LOGS_DISCORD_ID     = '1486169152459772005'; // Journal depuis le bot Discord
 const WELCOME_CHANNEL_ID  = '1488695814242045962'; // Salon d'arrivée des membres
 const REGLEMENT_CHANNEL_ID= '1486169077855813752'; // Salon règlement
-const TICKET_CHANNEL_ID   = '1334237812311982152'; // Salon tickets
+const TICKET_CHANNEL_ID   = '1488697077645971607'; // Salon tickets
 const ANNONCES_CHANNEL_ID = '1486169061531324620'; // Salon annonces / news
 
 // ── MESSAGES D'ACCUEIL (rotation aléatoire) ──────
