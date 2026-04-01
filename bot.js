@@ -644,7 +644,7 @@ client.on('interactionCreate', async interaction => {
         name: channelName,
         type: ChannelType.GuildText,
         parent: TICKET_CATEGORY_ID,
-        permissionOverwrites,
+        permissionOverwrites: permOverwrites,
       });
 
       // Message d'accueil dans le ticket
