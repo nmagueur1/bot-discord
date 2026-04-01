@@ -2,7 +2,8 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes,
         ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
         StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
-        ChannelType, PermissionFlagsBits } = require('discord.js');
+        ChannelType, PermissionFlagsBits,
+        ButtonBuilder, ButtonStyle } = require('discord.js');
 const { initializeApp } = require('firebase/app');
 const { getFirestore, doc, getDoc, setDoc, onSnapshot } = require('firebase/firestore');
 const admin = require('firebase-admin');
@@ -647,6 +648,20 @@ client.on('interactionCreate', async interaction => {
         permissionOverwrites: permOverwrites,
       });
 
+      // Boutons du ticket
+      const ticketButtons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('ticket-claim')
+          .setLabel('Prendre en charge')
+          .setEmoji('🙋')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('ticket-close')
+          .setLabel('Fermer le ticket')
+          .setEmoji('🔒')
+          .setStyle(ButtonStyle.Danger),
+      );
+
       // Message d'accueil dans le ticket
       await ticketChannel.send({
         content: `<@${interaction.user.id}>`,
@@ -658,9 +673,13 @@ client.on('interactionCreate', async interaction => {
             `**Raison :** ${option.description}\n\n` +
             `Un membre de l'équipe va prendre en charge ta demande dans les plus brefs délais.\n` +
             `Merci de **détailler ta demande** dès maintenant ci-dessous.`,
+          fields: [
+            { name: '📋 Statut', value: '⏳ En attente de prise en charge', inline: true },
+          ],
           footer: { text: 'Agence Immobilière · Système de tickets' },
           timestamp: new Date().toISOString(),
         }],
+        components: [ticketButtons],
       });
 
       await interaction.reply({
@@ -671,6 +690,85 @@ client.on('interactionCreate', async interaction => {
     } catch (err) {
       console.error('Erreur création ticket :', err.message);
       await interaction.reply({ content: `❌ Erreur lors de la création du ticket : ${err.message}`, ephemeral: true });
+    }
+  }
+
+  // ════════════════════════════════════════════════
+  // BOUTONS — TICKETS
+  // ════════════════════════════════════════════════
+  if (interaction.isButton()) {
+
+    // ── PRENDRE EN CHARGE ─────────────────────────
+    if (interaction.customId === 'ticket-claim') {
+      if (!isPatron(interaction)) {
+        await interaction.reply({ content: '❌ Seuls les membres du Staff peuvent prendre en charge un ticket.', ephemeral: true });
+        return;
+      }
+
+      const originalEmbed = interaction.message.embeds[0];
+
+      // Remplacer le champ Statut par le nom du staff
+      const fields = originalEmbed.fields
+        .filter(f => f.name !== '📋 Statut')
+        .concat([
+          { name: '📋 Statut',          value: '✅ Pris en charge',              inline: true },
+          { name: '🙋 Agent assigné',   value: `**${interaction.user.displayName}**`, inline: true },
+        ]);
+
+      const updatedEmbed = {
+        ...originalEmbed.data,
+        color: 0x4caf50,
+        fields,
+      };
+
+      // Désactiver le bouton "Prendre en charge", garder "Fermer"
+      const updatedButtons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('ticket-claim')
+          .setLabel('Pris en charge')
+          .setEmoji('✅')
+          .setStyle(ButtonStyle.Success)
+          .setDisabled(true),
+        new ButtonBuilder()
+          .setCustomId('ticket-close')
+          .setLabel('Fermer le ticket')
+          .setEmoji('🔒')
+          .setStyle(ButtonStyle.Danger),
+      );
+
+      await interaction.message.edit({ embeds: [updatedEmbed], components: [updatedButtons] });
+      await interaction.reply({ content: `🙋 **${interaction.user.displayName}** a pris en charge ce ticket.` });
+    }
+
+    // ── FERMER LE TICKET ──────────────────────────
+    if (interaction.customId === 'ticket-close') {
+      // Désactiver les deux boutons immédiatement
+      const disabledButtons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('ticket-claim')
+          .setLabel('Pris en charge')
+          .setEmoji('✅')
+          .setStyle(ButtonStyle.Success)
+          .setDisabled(true),
+        new ButtonBuilder()
+          .setCustomId('ticket-close')
+          .setLabel('Fermer le ticket')
+          .setEmoji('🔒')
+          .setStyle(ButtonStyle.Danger)
+          .setDisabled(true),
+      );
+      await interaction.message.edit({ components: [disabledButtons] });
+
+      await interaction.reply({
+        embeds: [{
+          description: `🔒 Ticket fermé par **${interaction.user.displayName}**. Suppression dans 5 secondes...`,
+          color: 0xf44336,
+        }]
+      });
+
+      setTimeout(async () => {
+        await interaction.channel.delete().catch(() => {});
+      }, 5000);
     }
   }
 
