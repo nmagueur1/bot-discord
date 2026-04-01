@@ -52,6 +52,7 @@ const TICKET_OPTIONS = [
   { label: '💰 Achat',       value: 'achat',       emoji: '💰', description: 'J\'ai un achat à faire.' },
   { label: '📩 Recrutement', value: 'recrutement', emoji: '📩', description: 'Je souhaite vous transmettre mon CV.' },
   { label: '🔑 Problème',    value: 'probleme',    emoji: '🔑', description: 'J\'ai besoin de vous pour régler un souci.' },
+  { label: '🚫 Annuler',     value: 'annuler',     emoji: '🚫', description: 'J\'ai changé d\'avis.' },
 ];
 
 // ── MESSAGES D'ACCUEIL (rotation aléatoire) ──────
@@ -638,6 +639,12 @@ client.on('interactionCreate', async interaction => {
   if (interaction.isStringSelectMenu() && interaction.customId === 'ticket-select') {
     const val    = interaction.values[0];
     const option = TICKET_OPTIONS.find(o => o.value === val);
+
+    // ── CAS ANNULATION ────────────────────────────
+    if (val === 'annuler') {
+      await interaction.reply({ content: 'Pas de souci, tu peux revenir quand tu veux ! 👋', ephemeral: true });
+      return;
+    }
 
     // ── CAS RECRUTEMENT : formulaire multi-étapes ──
     if (val === 'recrutement') {
