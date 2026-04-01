@@ -63,6 +63,10 @@ const roleReactConfig = new Map();
 // Map<transcriptKey, { text: string, channelName: string }>
 const ticketTranscripts = new Map();
 
+// ── NOTATION AGENTS (mémoire temporaire) ──────────
+// Map<ratingKey, { agentName: string, channelName: string }>
+const agentRatingStore = new Map();
+
 // ── OPTIONS TICKETS ───────────────────────────────
 const TICKET_OPTIONS = [
   { label: '❓ Question',       value: 'question',    emoji: '❓', description: 'J\'ai une question à vous poser.' },
@@ -432,21 +436,34 @@ async function closeTicketChannel(channel, closedByName = 'Automatique') {
 
     // ── GÉNÉRATION DU TRANSCRIPT (avant suppression du salon) ──
     let transcriptText = null;
+    let transcriptKey  = null;
     try {
       const allMsgs = await fetchAllMessages(channel);
       transcriptText = buildTranscript(channel, allMsgs, closedByName);
+      if (transcriptText) {
+        // Clé unique partagée entre le log staff ET le DM client
+        transcriptKey = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+        ticketTranscripts.set(transcriptKey, { text: transcriptText, channelName: channel.name });
+      }
     } catch (e) {
       console.error('Erreur génération transcript :', e.message);
     }
+
+    // Bouton réutilisé dans le log ET dans le DM
+    const transcriptComponents = transcriptKey ? [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ticket-transcript_${transcriptKey}`)
+          .setLabel('📄 Voir les messages')
+          .setStyle(ButtonStyle.Secondary)
+      )
+    ] : [];
 
     // ── LOG CHANNEL ────────────────────────────
     try {
       const logCh = await client.channels.fetch(TICKET_LOG_CHANNEL_ID);
       if (logCh) {
-        // Clé unique pour retrouver le transcript via le bouton
-        const transcriptKey = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-
-        const logMsg = await logCh.send({
+        await logCh.send({
           embeds: [{
             title: `🔒 Ticket fermé — ${channel.name}`,
             color: 0xf44336,
@@ -460,23 +477,8 @@ async function closeTicketChannel(channel, closedByName = 'Automatique') {
             timestamp: new Date().toISOString(),
             footer: { text: 'Agence Immobilière · Logs tickets' },
           }],
-          components: transcriptText ? [
-            new ActionRowBuilder().addComponents(
-              new ButtonBuilder()
-                .setCustomId(`ticket-transcript_${transcriptKey}`)
-                .setLabel('📄 Voir les messages')
-                .setStyle(ButtonStyle.Secondary)
-            )
-          ] : [],
+          components: transcriptComponents,
         });
-
-        // Stocker le transcript en mémoire
-        if (transcriptText && logMsg) {
-          ticketTranscripts.set(transcriptKey, {
-            text: transcriptText,
-            channelName: channel.name,
-          });
-        }
       }
     } catch (e) { console.error('Erreur log ticket :', e.message); }
 
@@ -484,19 +486,57 @@ async function closeTicketChannel(channel, closedByName = 'Automatique') {
     if (openerId) {
       try {
         const opener = await client.users.fetch(openerId);
-        await opener.send({ embeds: [{
-          title: '📬 Votre ticket a été clôturé — Agence Immobilière',
-          color: 0x5bb8d4,
-          description:
-            `Votre demande **${channel.name}** a bien été traitée et le ticket est maintenant fermé.\n\n` +
-            `Merci d'avoir contacté l'Agence Immobilière ! N'hésitez pas à utiliser \`/avis\` pour nous laisser un retour. ⭐`,
-          fields: [
-            { name: '⏱ Durée',  value: `${hours}h ${minutes}min`, inline: true },
-            { name: '🙋 Agent', value: claimedBy,                  inline: true },
-          ],
-          timestamp: new Date().toISOString(),
-          footer: { text: 'Agence Immobilière · Système de tickets' },
-        }]});
+        await opener.send({
+          embeds: [{
+            title: '📬 Votre ticket a été clôturé — Agence Immobilière',
+            color: 0x5bb8d4,
+            description:
+              `Votre demande **${channel.name}** a bien été traitée et le ticket est maintenant fermé.\n\n` +
+              `Merci d'avoir contacté l'Agence Immobilière ! ⭐`,
+            fields: [
+              { name: '⏱ Durée',  value: `${hours}h ${minutes}min`, inline: true },
+              { name: '🙋 Agent', value: claimedBy,                  inline: true },
+            ],
+            timestamp: new Date().toISOString(),
+            footer: { text: 'Agence Immobilière · Système de tickets' },
+          }],
+          components: transcriptComponents, // ← même bouton que dans le log staff
+        });
+
+        // ── DM DE NOTATION AGENT ──────────────────
+        // Envoyé uniquement si un agent a pris en charge le ticket
+        if (claimedBy !== 'Non pris en charge') {
+          const ratingKey = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+          agentRatingStore.set(ratingKey, { agentName: claimedBy, channelName: channel.name });
+
+          const ratingButtons = new ActionRowBuilder().addComponents(
+            [1, 2, 3, 4, 5].map(n =>
+              new ButtonBuilder()
+                .setCustomId(`agent-rate_${n}_${ratingKey}`)
+                .setLabel(`${n}`)
+                .setEmoji('⭐')
+                .setStyle(n <= 2 ? ButtonStyle.Danger : n === 3 ? ButtonStyle.Secondary : ButtonStyle.Success)
+            )
+          );
+
+          await opener.send({
+            embeds: [{
+              title: '⭐ Évaluez votre expérience',
+              color: 0xf4c542,
+              description:
+                `Comment s'est passé votre échange avec **${claimedBy}** ?\n\n` +
+                `Cliquez sur une note de **1 à 5 étoiles** — votre avis aide l'équipe à s'améliorer !`,
+              fields: [
+                { name: '🎫 Ticket', value: `\`${channel.name}\``, inline: true },
+                { name: '🙋 Agent', value: claimedBy,              inline: true },
+              ],
+              footer: { text: 'Agence Immobilière · Évaluation · Une seule note possible' },
+              timestamp: new Date().toISOString(),
+            }],
+            components: [ratingButtons],
+          });
+        }
+
       } catch { /* DMs fermés */ }
     }
 
@@ -1229,6 +1269,66 @@ client.on('interactionCreate', async interaction => {
       await interaction.reply({
         content: `📄 Transcript du ticket **${data.channelName}**`,
         files: [{ attachment: buffer, name: `transcript-${data.channelName}.txt` }],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // ── NOTATION AGENT ────────────────────────────
+    if (interaction.customId.startsWith('agent-rate_')) {
+      const parts  = interaction.customId.split('_');  // ['agent-rate', '3', 'abc123']
+      const stars  = parseInt(parts[1]);
+      const key    = parts[2];
+
+      const data = agentRatingStore.get(key);
+      if (!data) {
+        await interaction.reply({ content: '⚠️ Cette évaluation a déjà été soumise ou a expiré.', ephemeral: true });
+        return;
+      }
+
+      // Anti double-vote : supprimer immédiatement
+      agentRatingStore.delete(key);
+
+      // Désactiver les boutons sur le message DM (highlight la note choisie)
+      const disabledRow = new ActionRowBuilder().addComponents(
+        [1, 2, 3, 4, 5].map(n =>
+          new ButtonBuilder()
+            .setCustomId(`agent-rated_${n}`)
+            .setLabel(`${n}`)
+            .setEmoji('⭐')
+            .setStyle(n === stars ? ButtonStyle.Primary : ButtonStyle.Secondary)
+            .setDisabled(true)
+        )
+      );
+      await interaction.message.edit({ components: [disabledRow] }).catch(() => {});
+
+      // Poster dans le salon avis
+      const etoiles  = '⭐'.repeat(stars) + '☆'.repeat(5 - stars);
+      const couleurs = [0xf44336, 0xff9800, 0xffc107, 0x8bc34a, 0x4caf50];
+      const avisChannel = client.channels.cache.get(AVIS_CHANNEL_ID);
+      if (avisChannel) {
+        await avisChannel.send({ embeds: [{
+          title: `${etoiles} — Évaluation agent`,
+          color: couleurs[stars - 1],
+          description: stars >= 4
+            ? `*Excellente note ! L'agent a fait du bon travail.* 🎉`
+            : stars === 3
+            ? `*Note correcte. Toujours de la marge pour progresser !*`
+            : `*Note faible. Pensez à en discuter en interne.*`,
+          fields: [
+            { name: '⭐ Note',    value: `**${stars}/5** — ${etoiles}`,         inline: true  },
+            { name: '🙋 Agent',   value: data.agentName,                         inline: true  },
+            { name: '👤 Client',  value: `<@${interaction.user.id}>`,           inline: true  },
+            { name: '🎫 Ticket', value: `\`${data.channelName}\``,              inline: true  },
+          ],
+          thumbnail: { url: interaction.user.displayAvatarURL({ dynamic: true }) },
+          timestamp: new Date().toISOString(),
+          footer: { text: 'Agence Immobilière · Évaluations agents' },
+        }]});
+      }
+
+      await interaction.reply({
+        content: `✅ Merci pour votre note **${stars}/5** ! Votre retour a bien été enregistré.`,
         ephemeral: true,
       });
       return;
